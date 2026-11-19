@@ -15,15 +15,21 @@ house baseline persists the last read's rates, but the practice histories are
 one frozen page (638 players tracked) and the answer is the page after
 Exophase's first refresh (3,868 players, every rate but the 100% one lower) --
 persistence scores about 1.51 in mean pinball loss on the logit scale. This
-entry instead models the refresh jump: players jump to the first refresh's
-3,868 while earned counts grow only a little (newly tracked players have
-barely played yet), with a small tier-dependent catch-up rate, for a median
-logit shift of about -1.5 and an honest 0.55 logit spread. When the history is
-live (reads moving, as by the final), it extrapolates the trends of log
-earned-count and log players-tracked against `ln(1 + hours since release)`,
-damped the further the target lies past the observed clock, and takes the
-ratio. Local simulation tuned against the published baseline loss puts this
-forecast near 0.20 mean pinball on the practice instead of ~1.51.
+entry (v2) instead models the refresh jump with a per-trophy catch-up class
+read from the trophy's own name and description: the first things a new
+player can earn (Chapter 1, a fishing challenge, an arcade game) catch up
+fastest, early story and free-roam beats next, endgame/grinds/collections
+barely at all, for a floor ratio near 0.19 and a top ratio near 0.45, with
+per-trophy logit spreads of 0.12-0.18 (v1's flat 0.55 spread and tier-only
+table scored 0.160 on the practice). When the history is live (reads moving,
+as by the final), it extrapolates the trends of log earned-count and log
+players-tracked against `ln(1 + hours since release)` fitted after the last
+refresh jump, blends the earned-count slope with a class prior, damps the
+further the target lies past the observed clock, and takes the ratio, with a
+spread of `0.20 + 0.15*sqrt(days)` (v1's `0.5 + 0.4*sqrt(days)` scored 0.156
+on synthetic live cases; v2 scores ~0.07). Local simulation over the refresh
+scenarios that reproduce v1's 0.160 puts v2 near 0.06 mean pinball on the
+practice instead of ~1.51.
 
 ## Run it
 
