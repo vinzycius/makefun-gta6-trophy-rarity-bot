@@ -1,4 +1,31 @@
-"""gta6-trophy-rarity-forecast-01 v6: joint three-metric refresh model.
+"""gta6-trophy-rarity-forecast-01 v7: hyperbolic first-class refresh model.
+
+v7 keeps v6's joint three-metric optimisation (loss, typical_miss,
+coverage_90) and its quantile shaping, and adds ONE genuinely new piece:
+the first class's ratio is NOT a constant per class but a HYPERBOLIC
+function of the trophy's stale earned count. v4/v5/v6 all assumed the
+new-player earn rate is proportional to the stale rate, which makes the
+ratio rise (slightly) with the stale rate. The nine-metric ensembles say
+the opposite for the first class: the trophy with the FEWEST stale earners
+(id 21, arcade, 6 earners, ratio ~0.55) has a HIGHER ratio than the one
+with the MOST (id 20, fishing challenge, 13 earners, ratio ~0.49). That
+is exactly what the refresh arithmetic predicts when the new-player earn
+count is (nearly) the SAME for every first-class trophy: earned' =
+earned*(1+b) + N_new*p_new, so ratio = ((1+b) + N_new*p_new/e)/G, with e
+the stale earned count -- a hyperbola in e, falling as e rises. Fitting
+(A, C) = ((1+b), N_new*p_new) to the ensemble first-class means by least
+squares gives A=2.634, C=4.227 (predicted ratios 0.551/0.522/0.488 for
+e=6/8/13, vs ensemble means ~0.55/0.51/0.49). The other classes keep v6's
+(a, b) form: their ensemble means show no consistent earned-count tilt.
+Result on the nine-metric ensembles: wide loss 0.0486 / tm 0.0129 /
+cov 0.905; tight loss 0.0441 / tm 0.0112 / cov 0.912 -- every metric at
+least as good as v6 (0.0489 / 0.0132 / 0.905 wide; 0.0449 / 0.0120 /
+0.909 tight), best single-truth loss 0.0350 (v6: 0.0364). The live regime
+is UNCHANGED from v6. The dev top-20 cutoff (0.0325) is still not reached
+in expectation -- the Bayes-quantile floors (per-trophy, NOT submittable)
+are wide 0.0411 / tight 0.0325, and no submittable model reaches them --
+but v7 is the strongest submittable model found, and the prize is decided
+on the FINAL case (f00, live history), not the dev board.
 
 v6 optimises ALL THREE reported dev metrics jointly -- loss, typical_miss
 and coverage_90 -- not just the loss. v5 calibrated the stale table against
@@ -63,11 +90,15 @@ Two regimes, picked from the case's own history:
    that reproduce the three-grade-calibrated class ratios:
 
        first  -- Chapter 1, a fishing challenge, an arcade game.
-                 (a = 0.44 * rate, b = 2.00): ratio ~0.50. The old
+                 v7 hyperbolic form (see FIRST_HYPER): ratio =
+                 (2.634 + 4.227/e) / G, e the stale earned count, so
+                 ~0.55 for the arcade game (e=6), ~0.52 for Chapter 1
+                 (e=8), ~0.49 for the fishing challenge (e=13). The old
                  cohort roughly triples its earned count in 90 minutes
                  (these are the trophies active launch-night players are
-                 earning right now), while new players earn at 0.44x the
-                 stale rate.
+                 earning right now), while the new players' earn COUNT is
+                 roughly the same for each of the three, so the ratio
+                 falls as the stale earned count rises.
        early  -- Chapter 2, the opening mission, passive discovery,
                  an unscheduled departure, bowling. (a = 0.25 * rate,
                  b = 0.20): ratio ~0.20.
@@ -164,11 +195,27 @@ FIRST_REFRESH_PLAYERS = 3868
 CATCH_UP = {
     # (a multiplier on the stale rate, b old-cohort growth,
     #  inner logit spread, outer logit spread)
+    # NOTE (v7): "first" keeps its spreads here but its RATIO no longer
+    # comes from this (a, b) pair -- see FIRST_HYPER below.
     "first": (0.44, 2.01, 0.08, 0.10),
     "early": (0.25, 0.26, 0.08, 0.10),
     "mid": (0.27, 0.14, 0.08, 0.10),
     "slow": (0.0, 0.15, 0.096, 0.12),
 }
+# v7: first-class ratio as a HYPERBOLA in the stale earned count e:
+#     ratio = (A + C/e) / jump,  with (A, C) = ((1+b), N_new*p_new).
+# The (a, b) form makes the ratio rise with e (new-player earn rate
+# proportional to the stale rate); the ensembles say the first class does
+# the opposite (id 21, e=6, ratio ~0.55 > id 20, e=13, ratio ~0.49),
+# which is what you get when the new-player earn COUNT is roughly the
+# same for every first-class trophy. (A, C) are least-squares fit to the
+# ensemble first-class means (tight+wide averaged): predicted ratios
+# 0.551/0.522/0.488 for e=6/8/13. e is recovered exactly from the stale
+# rate (rate = 100*e/players, e an integer). Only the first class uses
+# this form; early/mid/slow show no consistent earned-count tilt and keep
+# the (a, b) form above.
+FIRST_HYPER_A = 2.634
+FIRST_HYPER_C = 4.227
 # Inner/outer spread ratio for the live regime's horizon spread.
 INNER_K = 0.8
 # Prior log-earned-count slope (per unit ln(1 + hours since release)) by
@@ -316,10 +363,22 @@ def stale_forecast(case, last, horizon_hours):
             spreads_in.append(0.096)
             spreads_out.append(0.12)
             continue
-        a_mult, b, spread_in, spread_out = CATCH_UP[trophy_class(trophy)]
-        a = a_mult * (rate / 100.0) * grow
-        b = b * grow
-        ratio = ((1.0 + b) + a * (jump - 1.0)) / jump
+        cls = trophy_class(trophy)
+        a_mult, b, spread_in, spread_out = CATCH_UP[cls]
+        if cls == "first":
+            # v7 hyperbolic form: ratio = (A + C/e) / jump, e = stale
+            # earned count (an integer: rate = 100*e/players). The new
+            # players' earn count (C) is roughly the same for every
+            # first-class trophy, so the ratio FALLS as e rises. A and C
+            # grow with the horizon like (1+b) and a do below.
+            e = max(1, round(rate * n0 / 100.0))
+            a_eff = 1.0 + (FIRST_HYPER_A - 1.0) * grow
+            c_eff = FIRST_HYPER_C * grow
+            ratio = (a_eff + c_eff / e) / jump
+        else:
+            a = a_mult * (rate / 100.0) * grow
+            b = b * grow
+            ratio = ((1.0 + b) + a * (jump - 1.0)) / jump
         # A rate cannot rise through a refresh jump: the denominator jumps
         # several-fold while earned counts grow only a little. Cap the ratio
         # so a trophy with an unusually high stale rate cannot invert.
