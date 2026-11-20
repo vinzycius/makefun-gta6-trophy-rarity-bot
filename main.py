@@ -1,4 +1,27 @@
-"""gta6-trophy-rarity-forecast-01 v7: hyperbolic first-class refresh model.
+"""gta6-trophy-rarity-forecast-01 v8: live-regime bias correction.
+
+v8 keeps v7's stale regime EXACTLY (hyperbolic first-class ratio, v6
+spreads/shaping -- dev loss tight 0.0442 / wide 0.0485, tm 0.0113/0.0129,
+cov 0.911/0.907, all practically at the Bayes floors) and fixes the LIVE
+regime, which decides the FINAL prize (f00, 10 Dec). The v7 live forecast
+was systematically biased HIGH on every synthetic live case: its median
+overshot the truth by +0.37 logit (first), +0.13 (early), +0.09 (mid),
++0.13 (slow), pooled over 5 cases -- the class-prior slopes
+(first 0.8 / early 0.5 / mid 0.35 / slow 0.2) extrapolate launch-week
+growth far past the point where the real earn-rate curves saturate
+(logistic toward p_inf). Scaling ALL class priors by 0.4x cuts the bias
+roughly in half (first +0.18, early +0.02, mid +0.02, slow +0.11) and
+cuts synthetic-live loss from 0.0984 to 0.0821 -- a 16% improvement that
+holds across FIVE independently drawn synthetic truths (seeds 7/11/23/42/99:
+-0.011 to -0.015 each), so it is a bias correction, not a fit to one
+truth. The optimum is interior and flat (x0.3-x0.5 all ~0.082-0.083; x0.0
+turns back up to 0.086), so 0.4x is a moderate correction, not an
+extreme. The live spread schedule is also retuned (0.10 + 0.03*sqrt(days)
+was 0.10 + 0.05*sqrt(days)) and the inner shaping 0.8x -> 0.6x, each
+worth ~0.001 on top. The dev top-20 cutoff (0.0325) is still not reached
+in expectation -- the Bayes floors (wide 0.0411 / tight 0.0325) say no
+submittable model reaches it -- but v8 is the strongest entry for the
+prize that is actually paid, the FINAL case.
 
 v7 keeps v6's joint three-metric optimisation (loss, typical_miss,
 coverage_90) and its quantile shaping, and adds ONE genuinely new piece:
@@ -217,10 +240,18 @@ CATCH_UP = {
 FIRST_HYPER_A = 2.634
 FIRST_HYPER_C = 4.227
 # Inner/outer spread ratio for the live regime's horizon spread.
-INNER_K = 0.8
+# v8: 0.6 (was 0.8) -- tighter inner quantiles cut live loss a little
+# further with identical tm/cov (see v8 live grid).
+INNER_K = 0.6
 # Prior log-earned-count slope (per unit ln(1 + hours since release)) by
 # class, used to steady the live regime's fitted trend.
-CLASS_SLOPE = {"first": 0.8, "early": 0.5, "mid": 0.35, "slow": 0.2}
+# v8: ALL priors scaled by 0.4x (first 0.32 / early 0.20 / mid 0.14 /
+# slow 0.08). The v7 priors extrapolated launch-week growth far past
+# saturation: on synthetic live cases the v7 live median overshot the
+# truth by +0.37 logit (first), +0.13 (early), +0.09 (mid), +0.13 (slow).
+# 0.4x halves that bias and cuts synthetic-live loss 0.0984 -> 0.0821,
+# robust across five independently drawn synthetic truths.
+CLASS_SLOPE = {"first": 0.32, "early": 0.20, "mid": 0.14, "slow": 0.08}
 
 # Keyword rules that class a trophy from its name + description. Checked in
 # order; the first match wins. "first" and "early" are the trophies a new
@@ -479,7 +510,10 @@ def live_forecast(case, horizon_hours):
         e_pred = min(max(e_pred, e_last), n_pred)
         medians.append(logit(100.0 * e_pred / n_pred))
     days = max(0.0, case["horizon_minutes"] / 1440.0)
-    spread = min(0.60, 0.10 + 0.05 * math.sqrt(days))
+    # v8: 0.10 + 0.03*sqrt(days) (was 0.10 + 0.05*sqrt(days)) -- the slower
+    # growth fits the saturating live curves better; worth ~0.001 on top of
+    # the prior correction, with coverage 0.913 (closest to honest 0.90).
+    spread = min(0.60, 0.10 + 0.03 * math.sqrt(days))
     # Quantile shaping (v6): the inner quantiles use 0.8x the outer spread.
     # Same as the stale regime -- it cuts synthetic-live loss from 0.0973
     # to 0.0954 with identical typical_miss and coverage (those depend only
