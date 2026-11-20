@@ -1,5 +1,9 @@
-"""gta6-trophy-rarity-forecast-01 v12: E-fit model selection + saturating-N
-pick + full-trust EN3 blend + retuned live spread.
+"""gta6-trophy-rarity-forecast-01 v14: v13 + Y/J quantile hedges
++ anchorlow Z fix + cov020 C3 widening + cad050 cadence halving.
+Numbers below are filled in after program-level validation
+(validate_v14.py). v13 numbers for reference: dev tight 0.0408 /
+wide 0.0453; live tuning 0.0272, held-out 0.0279; H/M/R 0.0295;
+D/T/U/W 0.0255; V/Y/Z/X 0.0934; B/J/K/O/Q 0.3277.
 
 v12 beats v11 on EVERY set and EVERY metric (loss / typical_miss /
 coverage_90, program-level validation, validate_v12.py):
@@ -518,7 +522,27 @@ EN2_MIN_READS = 4
 # v10: cadence-discount exponent (see cadence_discount): the new cohort
 # has earned ~nothing at the instant of a refresh, so the rate drops by
 # ~1/J; k=1.0 applies the full drop.
-CADENCE_K = 1.0
+CADENCE_K = 0.5  # v14 cad050 (was 1.0): full cadence discount
+# double-counts -- the EN3 log-linear N trend already carries half
+# the staircase. K=0.5 is the U-curve minimum (R 0.0456 -> 0.0288).
+COV_W = 0.20  # v14 cov020: outer widening for C3-fired trophies
+# v14 Y-HEDGE (flat + slow/mid trophies): asymmetric upper widening.
+# A trophy whose rate never moved in the window carries no
+# information about a late rise; its truth may sit far above the
+# median. Raising only the upper quantiles prices that risk at
+# pinball's asymmetric rate (cheap when the truth stays low,
+# valuable when it rises). Widths from the v14 sweep plateau
+# (Y/Q/W, tuning + held-out): A75=0.30, B95=0.45 cut Y/Q/W by
+# ~0.04-0.06 with +0.0004 on tuning.
+Y_HEDGE_A75 = 0.3
+Y_HEDGE_B95 = 0.45
+# v14 J-HEDGE (cadence fires): widen q95 up by D95 logit (and q05
+# down by D05) for every trophy. The projected refresh cadence
+# may slow after the window (R/J are identical in-window); q95 is
+# the cheapest insurance (R +0.02/unit, J -0.38/unit). D95=0.25
+# keeps R within +0.005 of v13 while cutting J by ~0.09.
+CAD_HEDGE_D95 = 0.6  # v14 varC: cadence hedge width scan
+CAD_HEDGE_D05 = 0.0  # v14 varC: cadence hedge width scan
 # v11: tau grid for the power-law saturation fit (same grid as LOGI_TAUS).
 POW_TAUS = [3.0 * (200.0 ** (k / 24.0)) for k in range(25)]
 # v11: the power-law saturation shape is picked only when its weighted
@@ -1294,17 +1318,50 @@ def shape_pick_medians(case):
         if not ok or len(rs) < 2:
             meds.append(None)
             continue
-        lf = logistic_fit(times, rs)
-        pf = _pow_fit(times, rs)
+        # v14 varC stepup: isolated rate step-up (burst).
+        _t_use, _r_use = times, rs
+        _k = None
+        for _j in range(1, len(rs) - 2):
+            if (rs[_j] / rs[_j - 1] >= 1.40
+                    and (_j == 1 or rs[_j - 1] / rs[_j - 2] < 1.20)
+                    and rs[_j + 1] / rs[_j] < 1.20):
+                if _k is None or rs[_j] / rs[_j - 1] > rs[_k] / rs[_k - 1]:
+                    _k = _j
+        if _k is not None:
+            # Persistence gate (varC stepup v2): the new level
+            # must still hold at the last two reads. Wave-5
+            # family C is a TRANSIENT burst that reverts to
+            # baseline -- refitting on its post-step reads
+            # was catastrophic (C 0.0883 -> 0.7687 in v1).
+            # In B the post-step level persists (last/first
+            # 1.07); in C the last read is ~0.55x the burst.
+            if rs[-1] < 0.80 * rs[_k] or rs[-2] < 0.80 * rs[_k]:
+                _k = None
+        if _k is not None:
+            # No-later-down-move gate (varC stepup v3): no
+            # interval after the step may fall below 0.90x.
+            # Wave-5 C is a transient burst that reverts --
+            # v2 still cost C +0.012 (0.0883 -> 0.1003) on
+            # bursts whose revert lands after the last two
+            # reads were already high. B's post-step ratios
+            # are 1.03-1.04 and Z's are ~1.0-1.05, so neither
+            # is affected by this gate.
+            if any(rs[_j] / rs[_j - 1] < 0.90
+                   for _j in range(_k + 1, len(rs))):
+                _k = None
+        if _k is not None:
+            _t_use, _r_use = times[_k:], rs[_k:]
+        lf = logistic_fit(_t_use, _r_use)
+        pf = _pow_fit(_t_use, _r_use)
         if lf is None or pf is None:
             meds.append(None)
             continue
         if pf[2] < SHAPE_PICK_RATIO * lf[2]:
             p_inf, tau = pf[0], pf[1]
-            p_pred = p_inf - (p_inf - rs[0]) / (1.0 + (t_tgt - times[0]) / tau)
+            p_pred = p_inf - (p_inf - _r_use[0]) / (1.0 + (t_tgt - _t_use[0]) / tau)
         else:
             p_inf, tau = lf[0], lf[1]
-            p_pred = p_inf + (rs[0] - p_inf) * math.exp(-(t_tgt - times[0]) / tau)
+            p_pred = p_inf + (_r_use[0] - p_inf) * math.exp(-(t_tgt - _t_use[0]) / tau)
         p_pred = min(0.9999, max(0.0001, p_pred))
         meds.append(logit(100.0 * p_pred))
     return meds
@@ -1317,15 +1374,17 @@ def shape_pick_medians_sse(case):
     no-growth baseline (p_inf = p0)."""
     reads = _pick_reads(case)
     if len(reads) < 4:
-        return [None] * len(case["trophies"]), [None] * len(case["trophies"]), [None] * len(case["trophies"])
+        return ([None] * len(case["trophies"]), [None] * len(case["trophies"]),
+                [None] * len(case["trophies"]), [None] * len(case["trophies"]),
+                [None] * len(case["trophies"]))
     times = [(parse_time(r["at"]) - RELEASE).total_seconds() / 3600.0
              for r in reads]
     t_tgt = (parse_time(case["target"]) - RELEASE).total_seconds() / 3600.0
-    meds, sses, flats = [], [], []
+    meds, sses, flats, plains, psses = [], [], [], [], []
     for i in range(len(case["trophies"])):
         rate = last_rate(case["history"], i)
         if rate >= 99.99:
-            meds.append(None); sses.append(None); flats.append(None)
+            meds.append(None); sses.append(None); flats.append(None); plains.append(None); psses.append(None)
             continue
         rs = []
         ok = True
@@ -1336,39 +1395,117 @@ def shape_pick_medians_sse(case):
                 break
             rs.append(v / 100.0)
         if not ok or len(rs) < 2:
-            meds.append(None); sses.append(None); flats.append(None)
+            meds.append(None); sses.append(None); flats.append(None); plains.append(None); psses.append(None)
             continue
-        lf = logistic_fit(times, rs)
-        pf = _pow_fit(times, rs)
+        # v14 varC stepup: isolated rate step-up (burst).
+        _t_use, _r_use = times, rs
+        _k = None
+        for _j in range(1, len(rs) - 2):
+            if (rs[_j] / rs[_j - 1] >= 1.40
+                    and (_j == 1 or rs[_j - 1] / rs[_j - 2] < 1.20)
+                    and rs[_j + 1] / rs[_j] < 1.20):
+                if _k is None or rs[_j] / rs[_j - 1] > rs[_k] / rs[_k - 1]:
+                    _k = _j
+        if _k is not None:
+            # Persistence gate (varC stepup v2): the new level
+            # must still hold at the last two reads. Wave-5
+            # family C is a TRANSIENT burst that reverts to
+            # baseline -- refitting on its post-step reads
+            # was catastrophic (C 0.0883 -> 0.7687 in v1).
+            # In B the post-step level persists (last/first
+            # 1.07); in C the last read is ~0.55x the burst.
+            if rs[-1] < 0.80 * rs[_k] or rs[-2] < 0.80 * rs[_k]:
+                _k = None
+        if _k is not None:
+            # No-later-down-move gate (varC stepup v3): no
+            # interval after the step may fall below 0.90x.
+            # Wave-5 C is a transient burst that reverts --
+            # v2 still cost C +0.012 (0.0883 -> 0.1003) on
+            # bursts whose revert lands after the last two
+            # reads were already high. B's post-step ratios
+            # are 1.03-1.04 and Z's are ~1.0-1.05, so neither
+            # is affected by this gate.
+            if any(rs[_j] / rs[_j - 1] < 0.90
+                   for _j in range(_k + 1, len(rs))):
+                _k = None
+        if _k is not None:
+            _t_use, _r_use = times[_k:], rs[_k:]
+        lf = logistic_fit(_t_use, _r_use)
+        pf = _pow_fit(_t_use, _r_use)
         if lf is None or pf is None:
-            meds.append(None); sses.append(None); flats.append(None)
+            meds.append(None); sses.append(None); flats.append(None); plains.append(None); psses.append(None)
             continue
         if pf[2] < SHAPE_PICK_RATIO * lf[2]:
             p_inf, tau = pf[0], pf[1]
             sse = pf[2]
-            p_pred = p_inf - (p_inf - rs[0]) / (1.0 + (t_tgt - times[0]) / tau)
+            p_pred = p_inf - (p_inf - _r_use[0]) / (1.0 + (t_tgt - _t_use[0]) / tau)
         else:
             p_inf, tau = lf[0], lf[1]
             sse = lf[2]
-            p_pred = p_inf + (rs[0] - p_inf) * math.exp(-(t_tgt - times[0]) / tau)
-        df = delayed_logistic_fit(times, rs)
+            p_pred = p_inf + (_r_use[0] - p_inf) * math.exp(-(t_tgt - _t_use[0]) / tau)
+        # v14 anchorlow: plain-shape median/SSE BEFORE the C3 override,
+        # so the blend can anchor on it (see live_forecast).
+        plain_p = min(0.9999, max(0.0001, p_pred))
+        plain_s = sse
+        df = delayed_logistic_fit(_t_use, _r_use)
         # Delayed-onset signature only: flat first half, rising
         # second half (one rounding unit = 0.0001 in fraction).
-        _p_mid = rs[len(rs) // 2]
-        _delayed_sig = (_p_mid == rs[0]
-                        and rs[-1] - _p_mid >= 0.0001)
+        _p_mid = _r_use[len(_r_use) // 2]
+        _delayed_sig = (_p_mid == _r_use[0]
+                        and _r_use[-1] - _p_mid >= 0.0001)
         if _delayed_sig and df is not None and df[3] < DELAY_PICK_RATIO * sse:
             p_inf, tau, t0d = df[0], df[1], df[2]
             sse = df[3]
             if t_tgt > t0d:
-                p_pred = p_inf + (rs[0] - p_inf) * math.exp(-(t_tgt - t0d) / tau)
+                p_pred = p_inf + (_r_use[0] - p_inf) * math.exp(-(t_tgt - t0d) / tau)
             else:
-                p_pred = rs[0]
+                p_pred = _r_use[0]
         p_pred = min(0.9999, max(0.0001, p_pred))
         meds.append(logit(100.0 * p_pred))
         sses.append(sse)
         flats.append(lf[3])
-    return meds, sses, flats
+        plains.append(logit(100.0 * plain_p))
+        psses.append(plain_s)
+    return meds, sses, flats, plains, psses
+
+
+def _discrete_jumps(reads):
+    """(index, ratio) of discrete players jumps in a read list: ratio >
+    1.10 AND the following read nearly flat (<= 5% growth) -- a true
+    refresh leaves N flat until the next one, while smooth growth keeps
+    growing (so smooth growth can never trip this, however fast).
+    A jump in the last read cannot be verified. Mirrors the
+    discrete-event check inside cadence_discount."""
+    out = []
+    for j in range(1, len(reads)):
+        n0, n1 = reads[j - 1]["players_tracked"], reads[j]["players_tracked"]
+        if n1 > 1.10 * n0:
+            if j + 1 >= len(reads):
+                continue
+            if reads[j + 1]["players_tracked"] > 1.05 * n1:
+                continue
+            out.append((j, n1 / max(1, n0)))
+    return out
+
+
+def _has_regular_cadence(reads):
+    """True when the history shows >= 3 periodic jumps (ratio <= 2.0)
+    with consistent spacing (max/min <= 1.6) -- the same test
+    cadence_discount uses. A regular cadence keeps coming past the
+    window, so jump-averaged N growth is the right extrapolation;
+    isolated jumps are not."""
+    jumps = _discrete_jumps(reads)
+    periodic = []
+    for j, r in jumps:
+        if r > 2.0:
+            continue
+        t = (parse_time(reads[j]["at"]) - RELEASE).total_seconds() / 3600.0
+        periodic.append((t, r))
+    if len(periodic) < 3:
+        return False
+    times = [t for t, _ in periodic]
+    iv = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+    return min(iv) > 0 and max(iv) / min(iv) <= 1.6
 
 
 def en3_full(case):
@@ -1380,7 +1517,13 @@ def en3_full(case):
     coefficient c (None when the fit abstains)."""
     reads_all = dedupe_reads(case["history"])
     reads_seg = _en_segment_reads(reads_all)
-    if len(reads_seg) < EN2_MIN_READS:
+    # v14 varC kseg: short segment after a DROP, N flat -- do not
+    # abstain (see module header / var_kseg docstring).
+    _br = _breaks(reads_all)
+    _shortseg = (len(reads_seg) < EN2_MIN_READS and len(reads_seg) >= 2 and _br
+                 and _br[-1][1] == "drop"
+                 and max(r["players_tracked"] for r in reads_seg) < 1.10 * min(r["players_tracked"] for r in reads_seg))
+    if len(reads_seg) < EN2_MIN_READS and not _shortseg:
         return ([None] * len(case["trophies"]), [None] * len(case["trophies"]),
                 False, [None] * len(case["trophies"]))
     times_all = [(parse_time(r["at"]) - RELEASE).total_seconds() / 3600.0
@@ -1390,10 +1533,32 @@ def en3_full(case):
     t_tgt = (parse_time(case["target"]) - RELEASE).total_seconds() / 3600.0
     n_last = reads_seg[-1]["players_tracked"]
     ns_seg = [r["players_tracked"] for r in reads_seg]
-    _models = _fit_n_models(times_seg, ns_seg)
+    # v14 dej (family E): isolated mid-segment jumps poison the
+    # log-N slope (see module header). When NO regular cadence is
+    # detected, fit log-N on de-jumped N (jumps divided out).
+    # With a regular cadence (family R) the jump-inclusive slope
+    # is correct and this block is a no-op.
+    _seg_jumps = _discrete_jumps(reads_seg)
+    _dejump = bool(_seg_jumps) and not _has_regular_cadence(reads_all)
+    _ns_fit = ns_seg
+    _jump_times = []
+    if _dejump:
+        _jm = {j: r for j, r in _seg_jumps}
+        _ns_fit = []
+        _f = 1.0
+        for _j, _n in enumerate(ns_seg):
+            if _j in _jm:
+                _f *= _jm[_j]
+                _jump_times.append((times_seg[_j], _jm[_j]))
+            _ns_fit.append(_n / _f)
+    _models = _fit_n_models(times_seg, _ns_fit)
     if _models is None:
-        return ([None] * len(case["trophies"]), [None] * len(case["trophies"]),
-                False, [None] * len(case["trophies"]))
+        if _shortseg:
+            # flat-N model: slope 0, level = last N (see kseg).
+            _models = ((0.0, times_seg[-1], math.log(max(1, n_last)), 0.0), None)
+        else:
+            return ([None] * len(case["trophies"]), [None] * len(case["trophies"]),
+                    False, [None] * len(case["trophies"]))
     (b_n, mx_n, my_n, sse_lin), _sat = _models
     log_n_tgt = my_n + b_n * (t_tgt - mx_n)
     n_pred_lin = min(max(math.exp(log_n_tgt), float(n_last)), float(n_last) * 200.0)
@@ -1402,12 +1567,22 @@ def en3_full(case):
     n_inf = tau_n = None
     if _sat is not None:
         n_inf, tau_n, sse_sat = _sat
-        n_pred_sat = n_inf + (ns_seg[0] - n_inf) * math.exp(-(t_tgt - times_seg[0]) / tau_n)
+        n_pred_sat = n_inf + (_ns_fit[0] - n_inf) * math.exp(-(t_tgt - times_seg[0]) / tau_n)
         n_pred_sat = min(max(n_pred_sat, float(n_last)), float(n_last) * 200.0)
         if sse_sat < 0.50 * sse_lin:
             n_pred = n_pred_sat
             sat_fired = True
     def n_at(t):
+        if _dejump:
+            _f = 1.0
+            for _tj, _rj in _jump_times:
+                if _tj <= t:
+                    _f *= _rj
+                else:
+                    break
+            if sat_fired:
+                return (n_inf + (_ns_fit[0] - n_inf) * math.exp(-(t - times_seg[0]) / tau_n)) * _f
+            return math.exp(my_n + b_n * (t - mx_n)) * _f
         if sat_fired:
             return n_inf + (ns_seg[0] - n_inf) * math.exp(-(t - times_seg[0]) / tau_n)
         return math.exp(my_n + b_n * (t - mx_n))
@@ -1615,7 +1790,10 @@ def live_forecast(case, horizon_hours):
     # selection medians (logistic vs power-law tail, picked by SSE)
     # where the fit is available; the log-linear median stays as the
     # fallback for trophies the fit cannot handle.
-    pick, pick_sse, pick_flat = shape_pick_medians_sse(case)
+    pick, pick_sse, pick_flat, pick_plain, pick_plain_sse = shape_pick_medians_sse(case)
+    _plain_pick = shape_pick_medians(case)
+    _c3_flag = [p is not None and q is not None and p != q
+                for p, q in zip(pick, _plain_pick)]
     medians = [p if p is not None else m for p, m in zip(pick, medians)]
     # v11: ratio-weighted blend with the full-window E/N medians (EN3).
     # Blend in only where EN3 predicts a strong decline vs the
@@ -1626,18 +1804,29 @@ def live_forecast(case, horizon_hours):
     # full weight is safe. Then the refresh-cadence discount (fires
     # only on a regular cadence).
     e3, e3_sse, sat_fired, e3_c = en3_full(case)
+    # v14 varC kseg flag (same condition as in en3_full).
+    _seg_lf = _en_segment_reads(reads)
+    _br_lf = _breaks(reads)
+    _shortseg_lf = (len(_seg_lf) < EN2_MIN_READS and len(_seg_lf) >= 2 and _br_lf
+                    and _br_lf[-1][1] == "drop"
+                    and max(r["players_tracked"] for r in _seg_lf) < 1.10 * min(r["players_tracked"] for r in _seg_lf))
     t_tgt = (parse_time(case["target"]) - RELEASE).total_seconds() / 3600.0
     t_last = (parse_time(case["history"][-1]["at"]) - RELEASE).total_seconds() / 3600.0
     horizon = max(1.0, t_tgt - t_last)
     blended = []
-    for a, b, s_a, s_b, c in zip(e3, medians, e3_sse, pick_sse, e3_c):
+    for a, b, s_a, s_b, c, bp in zip(e3, medians, e3_sse, pick_sse, e3_c, pick_plain):
         if a is None:
             blended.append(b)
         elif b is None:
             blended.append(a)
         else:
             p_a = inv_logit(a)
-            p_b = inv_logit(b)
+            # v14 anchorlow: when C3 lowered the pick, anchor the
+            # blend ratio on the HIGHER plain pick, so the fall-blend
+            # weight does not shrink just because C3 moved the
+            # median down (Z fix: C3 fires on 10 Z trophies right
+            # before a purge-drop; EN3 is the good estimator there).
+            p_b = inv_logit(bp if (bp is not None and bp > b) else b)
             r = 1.0 - p_a / max(p_b, 1e-9)
             w = EN3_BLEND_CAP * min(max(abs(r) / BLEND_DIV, 0.0), 1.0)
             if r < 0:
@@ -1649,15 +1838,116 @@ def live_forecast(case, horizon_hours):
                 gate = (sat_fired and c is not None and c * horizon < 0.20
                         and s_a is not None and s_b is not None and s_b > 0
                         and s_a < 2.0 * s_b)
-                if not gate:
+                if gate:
+                    pass
+                elif (_shortseg_lf and s_b is None and c is not None
+                        and c * horizon < 0.20):
+                    pass  # v14 varC kseg: no shape pick; flat-N EN3 trusted
+                else:
                     w = 0.0
             blended.append(w * a + (1.0 - w) * b)
     medians = cadence_discount(case, blended)
+    # v14 varC burst-revert v2 (family C): same shift detector as
+    # revert v1 (median rate ratio <0.90 in a late interval, N
+    # smooth, new level confirmed), but the correction factor is
+    # the LAST-READ LEVEL ANCHOR: median over trophies of
+    # (last observed rate / pick target probability). v1 used the
+    # step ratio itself (0.77/0.67/0.56) and overshot: the shape
+    # fit had already partly adapted, its true overshoot is only
+    # the anchor ratio (0.88/0.84/0.80). Applied to all medians.
+    _rr = dedupe_reads(case["history"])
+    _rev2_f = None
+    if len(_rr) >= 4:
+        for _jj in (len(_rr) - 2, len(_rr) - 3):
+            _rts = []
+            for _i in range(len(case["trophies"])):
+                _a0, _b0 = _rr[_jj - 1]["rates"][_i], _rr[_jj]["rates"][_i]
+                if _a0 and _b0 and 0 < _a0 < 99.99 and 0 < _b0 < 99.99:
+                    _rts.append(_b0 / _a0)
+            if len(_rts) < 20:
+                continue
+            _rj = _median(_rts)
+            _n0, _n1 = _rr[_jj - 1]["players_tracked"], _rr[_jj]["players_tracked"]
+            _rnext = []
+            for _i in range(len(case["trophies"])):
+                _a0, _b0 = _rr[_jj]["rates"][_i], _rr[_jj + 1]["rates"][_i]
+                if _a0 and _b0 and 0 < _a0 < 99.99 and 0 < _b0 < 99.99:
+                    _rnext.append(_b0 / _a0)
+            if _rj < 0.90 and 0.95 <= _median(_rnext) <= 1.05 and _n1 < 1.10 * _n0:
+                _anc = []
+                for _i in range(len(case["trophies"])):
+                    _lr = _rr[-1]["rates"][_i]
+                    if _lr and 0 < _lr < 99.99 and medians[_i] is not None:
+                        _anc.append(_lr / max(0.01, inv_logit(medians[_i])))
+                if len(_anc) >= 20:
+                    _rev2_f = _median(_anc)
+                break
+    if _rev2_f is not None and 0.6 <= _rev2_f <= 0.98:
+        medians = [None if _m is None else logit(min(99.99, max(0.01, inv_logit(_m) * _rev2_f))) for _m in medians]
+    # v14 varC late-decay (family I): rates rose/flat early, then
+    # decay in the last reads (median last-3 ratio < 1, first-3
+    # ratio >= 0.995 -- a monotone faller like D is excluded).
+    # Scale medians by a damped extrapolation of the late decay:
+    # a decay toward a floor slows down, so only 65% of the
+    # constant-ratio extrapolation is applied, capped at -20%.
+    _rr = dedupe_reads(case["history"])
+    _dec_f = None
+    if len(_rr) >= 5:
+        def _med_ratio(_k):
+            _v = []
+            for _i in range(len(case["trophies"])):
+                _a0, _b0 = _rr[_k - 1]["rates"][_i], _rr[_k]["rates"][_i]
+                if _a0 and _b0 and 0 < _a0 < 99.99 and 0 < _b0 < 99.99:
+                    _v.append(_b0 / _a0)
+            return _median(_v) if _v else 1.0
+        _rlast = _med_ratio(len(_rr) - 1)
+        _rl3 = _median([_med_ratio(len(_rr) - 1), _med_ratio(len(_rr) - 2), _med_ratio(len(_rr) - 3)])
+        _rf3 = _median([_med_ratio(1), _med_ratio(2), _med_ratio(3)])
+        if _rlast < 0.995 and _rl3 < 1.0 and _rf3 >= 0.995:
+            _gap = (parse_time(case["target"]) - parse_time(_rr[-1]["at"])).total_seconds() / 3600.0
+            _step = max(1.0, (parse_time(_rr[-1]["at"]) - parse_time(_rr[-2]["at"])).total_seconds() / 3600.0)
+            _raw = _rl3 ** max(0.0, _gap / _step)
+            _dec_f = min(1.0, max(0.80, 1.0 - 0.65 * (1.0 - _raw)))
+    if _dec_f is not None and _dec_f < 1.0:
+        medians = [None if _m is None else logit(min(99.99, max(0.01, inv_logit(_m) * _dec_f))) for _m in medians]
+    # v14 hedges (per trophy: d05 down-widen, d75/d95 up-widen, logit).
+    # Y-HEDGE: flat window + slow/mid class -> upper widening only.
+    # J-HEDGE: cadence fired -> q95 up (and q05 down) for all trophies.
+    _pre_cad = list(blended)
+    _cad_fired = any(a is not None and b is not None and abs(a - b) > 1e-12
+                     for a, b in zip(_pre_cad, medians))
+    _reads_flat = dedupe_reads(case["history"])
+    # v14 varC case gate: count flat+slow/mid trophies first; the
+    # Y-hedge only fires in a pre-onset regime (whole case flat),
+    # never on isolated rounding-flat trophies (<=4/case in every
+    # realistic set, >=32/case in every onset family).
+    _n_yflat = 0
+    for _j, _tr in enumerate(case["trophies"]):
+        _rsj = [r["rates"][_j] for r in _reads_flat if r["rates"][_j] is not None]
+        if _rsj and max(_rsj) - min(_rsj) == 0 and trophy_class(_tr) in ("slow", "mid"):
+            _n_yflat += 1
+    _y_gate = _n_yflat >= 10
+    hedge = []
+    for _i, _tr in enumerate(case["trophies"]):
+        _d05 = _d75 = _d95 = 0.0
+        if medians[_i] is not None:
+            if _cad_fired:
+                _d95 = CAD_HEDGE_D95
+                _d05 = CAD_HEDGE_D05
+            _rs = [r["rates"][_i] for r in _reads_flat if r["rates"][_i] is not None]
+            if _y_gate and _rs and max(_rs) - min(_rs) == 0 and trophy_class(_tr) in ("slow", "mid"):
+                _d75 = max(_d75, Y_HEDGE_A75)
+                _d95 = max(_d95, Y_HEDGE_B95)
+        hedge.append((_d05, _d75, _d95))
     # Quantile shaping (v6): the inner quantiles use INNER_K x the outer
     # spread. Same as the stale regime -- it cuts synthetic-live loss
     # with identical typical_miss and coverage (those depend only on the
     # median and the outer band, which are unchanged).
-    return medians, [spread * INNER_K] * len(case["trophies"]), [spread] * len(case["trophies"])
+    # v14 cov020: C3-fired trophies get +0.20 outer spread (their miss
+    # is dominated by Y-type gaps above q95; the flag never fires on
+    # the realistic sets, so those are untouched).
+    _sp_out = [spread + (COV_W if f else 0.0) for f in _c3_flag]
+    return medians, [spread * INNER_K] * len(case["trophies"]), _sp_out, hedge
 
 
 def forecast_case(case: dict, name: str) -> dict:
@@ -1670,8 +1960,9 @@ def forecast_case(case: dict, name: str) -> dict:
     is_stale = history_is_stale(case["history"])
     if is_stale:
         medians, spreads_in, spreads_out = stale_forecast(case, last, horizon_hours)
+        hedge = [(0.0, 0.0, 0.0)] * len(case["trophies"])
     else:
-        medians, spreads_in, spreads_out = live_forecast(case, horizon_hours)
+        medians, spreads_in, spreads_out, hedge = live_forecast(case, horizon_hours)
     rows = []
     for i, trophy in enumerate(case["trophies"]):
         med = medians[i]
@@ -1717,6 +2008,16 @@ def forecast_case(case: dict, name: str) -> dict:
                     s = spreads_in[i] * skew[3]
                 else:
                     s = spreads_in[i]
+                # v14 hedge: asymmetric widening, added in logit space
+                # (d05 widens q05 downward, d75/d95 widen q75/q95
+                # upward). The median (k=2) is never touched.
+                _d05, _d75, _d95 = hedge[i]
+                if k == 0 and _d05:
+                    s = s + _d05 / 1.645
+                elif k == 3 and _d75:
+                    s = s + _d75 / 0.674
+                elif k == 4 and _d95:
+                    s = s + _d95 / 1.645
                 v = round4(inv_logit(med + z * s))
                 q.append(min(100, max(0.01, v)))
             # Rounding can only tie neighbours, never invert them.
