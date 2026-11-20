@@ -525,6 +525,10 @@ POW_TAUS = [3.0 * (200.0 ** (k / 24.0)) for k in range(25)]
 # in-sample SSE is below this fraction of the logistic's SSE (guards
 # against noisy picks on short segments, e.g. family H).
 SHAPE_PICK_RATIO = 0.5
+# v13: the delayed-logistic shape is picked only when its weighted
+# in-sample SSE is below this fraction of the best plain shape's
+# SSE (guards against fitting noise with the extra onset parameter).
+DELAY_PICK_RATIO = 0.8
 # v11: ratio-weighted EN3 blend cap (was 0.30 in v10). EN3's decline
 # signal is accurate enough now that the full weight is safe: the blend
 # still fires only where EN3 predicts a strong decline vs the
@@ -1127,6 +1131,16 @@ def cadence_discount(case, medians):
     for j in range(1, len(reads)):
         n0, n1 = reads[j - 1]["players_tracked"], reads[j]["players_tracked"]
         if n1 > 1.10 * n0:
+            # discrete-event check: N must be essentially flat in
+            # the interval AFTER the jump read. Smooth growth shows
+            # >5% in the next interval too (families V/O) and is not
+            # a refresh; a true refresh leaves N flat until the next
+            # one. A jump in the last read cannot be verified.
+            if j + 1 >= len(reads):
+                continue
+            n2 = reads[j + 1]["players_tracked"]
+            if n2 > 1.05 * n1:
+                continue
             t = (parse_time(reads[j]["at"]) - RELEASE).total_seconds() / 3600.0
             jumps.append((t, n1 / max(1, n0)))
     periodic = [(t, r) for (t, r) in jumps if r <= 2.0]
@@ -1186,6 +1200,57 @@ def _pow_fit(times, rates):
     return best
 
 
+def _pick_reads(case):
+    """Reads the saturation-shape pick fits on: post-jump reads only
+    when a rate cliff is detected, else all reads."""
+    reads = dedupe_reads(case["history"])
+    if len(reads) < 2:
+        return reads
+    if has_rate_cliff(reads):
+        reads = post_jump_reads(reads)
+        if len(reads) < 2:
+            reads = dedupe_reads(case["history"])
+    return reads
+
+
+def _path_sse(times, rates, pred_rates):
+    """Weighted SSE of a predicted rate path vs observed rates, with
+    the same logit-space weights the saturation fits use."""
+    s = 0.0
+    for p, q in zip(rates, pred_rates):
+        w = 1.0 / max(1e-10, (p * (1.0 - p)) ** 2)
+        s += w * (p - q) ** 2
+    return s
+
+
+def delayed_logistic_fit(times, rates):
+    """Fit p(t) = p0 for t <= t0, else p_inf - (p_inf-p0)*exp(-(t-t0)/tau).
+    t0 grids over read times and midpoints; tau over LOGI_TAUS. For
+    fixed (t0, tau) the model is linear in p_inf (weighted LS, same
+    logit-space weights as logistic_fit). Returns (p_inf, tau, t0, sse)
+    or None. At t0 = times[0] it reduces to the plain logistic."""
+    t0r = times[0]
+    p0 = rates[0]
+    w = [1.0 / max(1e-10, (p * (1.0 - p)) ** 2) for p in rates]
+    t0_grid = sorted(set(list(times) +
+                       [(times[k] + times[k + 1]) / 2 for k in range(len(times) - 1)]))
+    best = None
+    for t0 in t0_grid:
+        for tau in LOGI_TAUS:
+            u = [0.0 if t <= t0 else 1.0 - math.exp(-(t - t0) / tau) for t in times]
+            y = [p - p0 * (1.0 - ui) for p, ui in zip(rates, u)]
+            num = sum(wi * ui * yi for wi, ui, yi in zip(w, u, y))
+            den = sum(wi * ui * ui for wi, ui in zip(w, u))
+            if den <= 0:
+                continue
+            p_inf = min(0.995, max(0.0002, num / den))
+            sse = sum(wi * (p - (p0 + (p_inf - p0) * ui)) ** 2
+                      for wi, p, ui in zip(w, rates, u))
+            if best is None or sse < best[3]:
+                best = (p_inf, tau, t0, sse)
+    return best
+
+
 def shape_pick_medians(case):
     """Saturation-shape selection medians (logit), v11.
 
@@ -1199,6 +1264,8 @@ def shape_pick_medians(case):
     segments (family H): a marginal SSE win is not evidence the heavy
     tail is real. Returns None for a trophy when neither fit is
     available; the caller falls back to the log-linear median.
+    Use shape_pick_medians_sse() when the in-sample SSE of the chosen
+    shape is needed as well.
     """
     reads = dedupe_reads(case["history"])
     if len(reads) < 2:
@@ -1241,6 +1308,153 @@ def shape_pick_medians(case):
         p_pred = min(0.9999, max(0.0001, p_pred))
         meds.append(logit(100.0 * p_pred))
     return meds
+
+
+def shape_pick_medians_sse(case):
+    """(medians, sse, sse_flat) per trophy for the saturation-shape
+    pick: sse is the weighted in-sample SSE of the CHOSEN shape
+    (logistic or power-law) on the pick's read set; sse_flat is the
+    no-growth baseline (p_inf = p0)."""
+    reads = _pick_reads(case)
+    if len(reads) < 4:
+        return [None] * len(case["trophies"]), [None] * len(case["trophies"]), [None] * len(case["trophies"])
+    times = [(parse_time(r["at"]) - RELEASE).total_seconds() / 3600.0
+             for r in reads]
+    t_tgt = (parse_time(case["target"]) - RELEASE).total_seconds() / 3600.0
+    meds, sses, flats = [], [], []
+    for i in range(len(case["trophies"])):
+        rate = last_rate(case["history"], i)
+        if rate >= 99.99:
+            meds.append(None); sses.append(None); flats.append(None)
+            continue
+        rs = []
+        ok = True
+        for r in reads:
+            v = r["rates"][i]
+            if v is None or v <= 0:
+                ok = False
+                break
+            rs.append(v / 100.0)
+        if not ok or len(rs) < 2:
+            meds.append(None); sses.append(None); flats.append(None)
+            continue
+        lf = logistic_fit(times, rs)
+        pf = _pow_fit(times, rs)
+        if lf is None or pf is None:
+            meds.append(None); sses.append(None); flats.append(None)
+            continue
+        if pf[2] < SHAPE_PICK_RATIO * lf[2]:
+            p_inf, tau = pf[0], pf[1]
+            sse = pf[2]
+            p_pred = p_inf - (p_inf - rs[0]) / (1.0 + (t_tgt - times[0]) / tau)
+        else:
+            p_inf, tau = lf[0], lf[1]
+            sse = lf[2]
+            p_pred = p_inf + (rs[0] - p_inf) * math.exp(-(t_tgt - times[0]) / tau)
+        df = delayed_logistic_fit(times, rs)
+        # Delayed-onset signature only: flat first half, rising
+        # second half (one rounding unit = 0.0001 in fraction).
+        _p_mid = rs[len(rs) // 2]
+        _delayed_sig = (_p_mid == rs[0]
+                        and rs[-1] - _p_mid >= 0.0001)
+        if _delayed_sig and df is not None and df[3] < DELAY_PICK_RATIO * sse:
+            p_inf, tau, t0d = df[0], df[1], df[2]
+            sse = df[3]
+            if t_tgt > t0d:
+                p_pred = p_inf + (rs[0] - p_inf) * math.exp(-(t_tgt - t0d) / tau)
+            else:
+                p_pred = rs[0]
+        p_pred = min(0.9999, max(0.0001, p_pred))
+        meds.append(logit(100.0 * p_pred))
+        sses.append(sse)
+        flats.append(lf[3])
+    return meds, sses, flats
+
+
+def en3_full(case):
+    """(medians, sse, sat_fired, cs) for EN3. sse is the weighted
+    in-sample SSE of EN3's implied rate path E_fit(t)/N_fit(t)
+    against the observed rates, on the SAME read set the pick uses.
+    sat_fired is True when the saturating-N model was picked for
+    this case; cs holds each trophy's fitted exponential E
+    coefficient c (None when the fit abstains)."""
+    reads_all = dedupe_reads(case["history"])
+    reads_seg = _en_segment_reads(reads_all)
+    if len(reads_seg) < EN2_MIN_READS:
+        return ([None] * len(case["trophies"]), [None] * len(case["trophies"]),
+                False, [None] * len(case["trophies"]))
+    times_all = [(parse_time(r["at"]) - RELEASE).total_seconds() / 3600.0
+                 for r in reads_all]
+    times_seg = [(parse_time(r["at"]) - RELEASE).total_seconds() / 3600.0
+                 for r in reads_seg]
+    t_tgt = (parse_time(case["target"]) - RELEASE).total_seconds() / 3600.0
+    n_last = reads_seg[-1]["players_tracked"]
+    ns_seg = [r["players_tracked"] for r in reads_seg]
+    _models = _fit_n_models(times_seg, ns_seg)
+    if _models is None:
+        return ([None] * len(case["trophies"]), [None] * len(case["trophies"]),
+                False, [None] * len(case["trophies"]))
+    (b_n, mx_n, my_n, sse_lin), _sat = _models
+    log_n_tgt = my_n + b_n * (t_tgt - mx_n)
+    n_pred_lin = min(max(math.exp(log_n_tgt), float(n_last)), float(n_last) * 200.0)
+    n_pred = n_pred_lin
+    sat_fired = False
+    n_inf = tau_n = None
+    if _sat is not None:
+        n_inf, tau_n, sse_sat = _sat
+        n_pred_sat = n_inf + (ns_seg[0] - n_inf) * math.exp(-(t_tgt - times_seg[0]) / tau_n)
+        n_pred_sat = min(max(n_pred_sat, float(n_last)), float(n_last) * 200.0)
+        if sse_sat < 0.50 * sse_lin:
+            n_pred = n_pred_sat
+            sat_fired = True
+    def n_at(t):
+        if sat_fired:
+            return n_inf + (ns_seg[0] - n_inf) * math.exp(-(t - times_seg[0]) / tau_n)
+        return math.exp(my_n + b_n * (t - mx_n))
+    reads_pick = _pick_reads(case)
+    times_pick = [(parse_time(r["at"]) - RELEASE).total_seconds() / 3600.0
+                  for r in reads_pick]
+    meds, sses, cs = [], [], []
+    for i in range(len(case["trophies"])):
+        rate = last_rate(case["history"], i)
+        if rate >= 99.99:
+            meds.append(None); sses.append(None); cs.append(None)
+            continue
+        xs_ln, xs_t, ys = [], [], []
+        for j, r in enumerate(reads_all):
+            v = r["rates"][i]
+            if v is None or v <= 0:
+                continue
+            xs_ln.append(math.log1p(max(0.0, times_all[j])))
+            xs_t.append(times_all[j])
+            ys.append(math.log(max(0.5, v * r["players_tracked"] / 100.0)))
+        if len(xs_ln) < EN2_MIN_READS:
+            meds.append(None); sses.append(None); cs.append(None)
+            continue
+        fit = _fit_log_e_wls(xs_ln, xs_t, ys, None, 0.90)
+        if fit is None:
+            meds.append(None); sses.append(None); cs.append(None)
+            continue
+        a, b, c = fit
+        cs.append(c)
+        log_e_tgt = a + b * math.log1p(max(0.0, t_tgt)) + c * t_tgt
+        e_last = max(0.5, rate * n_last / 100.0)
+        e_pred = min(max(math.exp(log_e_tgt), e_last), n_pred)
+        p_pred = 100.0 * e_pred / n_pred
+        p_pred = min(p_pred, 5.0 * rate)
+        p_pred = min(99.99, max(0.01, p_pred))
+        meds.append(logit(p_pred))
+        obs, pred = [], []
+        for j, r in enumerate(reads_pick):
+            v = r["rates"][i]
+            if v is None or v <= 0:
+                continue
+            e_t = math.exp(a + b * math.log1p(max(0.0, times_pick[j])) + c * times_pick[j])
+            n_t = max(1.0, n_at(times_pick[j]))
+            obs.append(v / 100.0)
+            pred.append(min(0.9999, max(0.0001, e_t / n_t)))
+        sses.append(_path_sse(times_pick, obs, pred) if len(obs) >= 2 else None)
+    return meds, sses, sat_fired, cs
 
 
 def en3_live_medians(case):
@@ -1401,7 +1615,7 @@ def live_forecast(case, horizon_hours):
     # selection medians (logistic vs power-law tail, picked by SSE)
     # where the fit is available; the log-linear median stays as the
     # fallback for trophies the fit cannot handle.
-    pick = shape_pick_medians(case)
+    pick, pick_sse, pick_flat = shape_pick_medians_sse(case)
     medians = [p if p is not None else m for p, m in zip(pick, medians)]
     # v11: ratio-weighted blend with the full-window E/N medians (EN3).
     # Blend in only where EN3 predicts a strong decline vs the
@@ -1411,9 +1625,12 @@ def live_forecast(case, horizon_hours):
     # 0.30 in v10): EN3's decline signal is accurate enough that the
     # full weight is safe. Then the refresh-cadence discount (fires
     # only on a regular cadence).
-    e3 = en3_live_medians(case)
+    e3, e3_sse, sat_fired, e3_c = en3_full(case)
+    t_tgt = (parse_time(case["target"]) - RELEASE).total_seconds() / 3600.0
+    t_last = (parse_time(case["history"][-1]["at"]) - RELEASE).total_seconds() / 3600.0
+    horizon = max(1.0, t_tgt - t_last)
     blended = []
-    for a, b in zip(e3, medians):
+    for a, b, s_a, s_b, c in zip(e3, medians, e3_sse, pick_sse, e3_c):
         if a is None:
             blended.append(b)
         elif b is None:
@@ -1422,7 +1639,18 @@ def live_forecast(case, horizon_hours):
             p_a = inv_logit(a)
             p_b = inv_logit(b)
             r = 1.0 - p_a / max(p_b, 1e-9)
-            w = EN3_BLEND_CAP * min(max(r / BLEND_DIV, 0.0), 1.0)
+            w = EN3_BLEND_CAP * min(max(abs(r) / BLEND_DIV, 0.0), 1.0)
+            if r < 0:
+                # EN3 predicts a RISE: trust it only when (a) N
+                # visibly saturates, (b) the E fit is non-explosive,
+                # and (c) EN3's implied in-sample path fits at least
+                # half as well as the pick's shape. (c) closes the
+                # gate for flat windows (pick SSE = 0 exactly).
+                gate = (sat_fired and c is not None and c * horizon < 0.20
+                        and s_a is not None and s_b is not None and s_b > 0
+                        and s_a < 2.0 * s_b)
+                if not gate:
+                    w = 0.0
             blended.append(w * a + (1.0 - w) * b)
     medians = cadence_discount(case, blended)
     # Quantile shaping (v6): the inner quantiles use INNER_K x the outer
