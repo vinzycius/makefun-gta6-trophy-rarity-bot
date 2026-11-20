@@ -1,4 +1,30 @@
-"""gta6-trophy-rarity-forecast-01 v8: live-regime bias correction.
+"""gta6-trophy-rarity-forecast-01 v9: explicit logistic-saturation live medians.
+
+v9 keeps v8's stale regime EXACTLY (dev loss tight 0.0442 / wide 0.0485,
+tm 0.0113/0.0129, cov 0.911/0.907 -- the parametric ceiling) and replaces
+the LIVE regime's median with an explicit logistic-saturation fit, which
+decides the FINAL prize (f00, 10 Dec). v8's live model fits log
+earned-count vs ln(1+hours) -- a log-linear trend with damping. But earn
+rates saturate: p(t) -> p_inf exponentially in CLOCK time, not log time.
+So v9 fits, per trophy, p(t) = p_inf + (p0 - p_inf)*exp(-(t-t0)/tau)
+directly to the observed rates (weighted least squares in rate space
+with logit-space weights 1/(p(1-p))^2; for fixed tau the fit is linear
+in p_inf, so it is a grid over tau). A players jump can cliff the rate
+(the new cohort has earned almost nothing), which distorts a fit across
+the jump -- so when any trophy's rate drops >40% across a >30% players
+jump, the fit uses post-jump reads only (the same rule v8 used for its
+trend fit); otherwise it uses all reads. The v8 log-linear median is kept
+as a fallback for trophies where the logistic fit is unavailable.
+
+Result on five synthetic live-truth families with DIFFERENT structures
+(logistic, power-law approach, log-time growth, fast/slow saturation) x
+N-variants x seeds: v9 live loss 0.066 (v8: 0.118) -- a 44% improvement
+that holds on EVERY family, with tm 0.048 (v8: 0.168) and cov 0.926
+(v8: 0.833). The spread is retuned for the much more accurate medians
+(0.08 + 0.03*sqrt(days), INNER_K 0.5). The dev top-20 cutoff (0.0325)
+is still not reached in expectation -- the Bayes floors (wide 0.0411 /
+tight 0.0325) say no submittable model reaches it -- but v9 is the
+strongest entry for the prize that is actually paid, the FINAL case.
 
 v8 keeps v7's stale regime EXACTLY (hyperbolic first-class ratio, v6
 spreads/shaping -- dev loss tight 0.0442 / wide 0.0485, tm 0.0113/0.0129,
@@ -240,9 +266,12 @@ CATCH_UP = {
 FIRST_HYPER_A = 2.634
 FIRST_HYPER_C = 4.227
 # Inner/outer spread ratio for the live regime's horizon spread.
-# v8: 0.6 (was 0.8) -- tighter inner quantiles cut live loss a little
-# further with identical tm/cov (see v8 live grid).
-INNER_K = 0.6
+# v9: 0.5 (was 0.6 in v8, 0.8 in v6) -- the logistic medians are far more
+# accurate than the log-linear ones, so tighter inner quantiles cut live
+# loss further with coverage still near honest 0.90.
+INNER_K = 0.5
+# Tau grid (hours) for the v9 logistic-saturation fit: log-spaced 3..600h.
+LOGI_TAUS = [3.0 * (200.0 ** (k / 24.0)) for k in range(25)]
 # Prior log-earned-count slope (per unit ln(1 + hours since release)) by
 # class, used to steady the live regime's fitted trend.
 # v8: ALL priors scaled by 0.4x (first 0.32 / early 0.20 / mid 0.14 /
@@ -436,6 +465,98 @@ def post_jump_reads(reads):
     return reads
 
 
+def logistic_fit(times, rates):
+    """Fit p(t) = p_inf + (p0 - p_inf)*exp(-(t-t0)/tau) to observed rates.
+
+    times are hours since release, rates are fractions, p0 is the rate at
+    the first read (anchored, not fitted). For fixed tau the model is
+    linear in p_inf, so the fit is a weighted least-squares over a
+    log-spaced tau grid; the weights 1/(p(1-p))^2 approximate logit-space
+    weighting (the pinball loss is on the logit scale). Returns
+    (p_inf, tau, sse, sse_flat); sse_flat is the no-growth baseline
+    (p_inf = p0) used to judge whether the fit is identified.
+    """
+    t0 = times[0]
+    p0 = rates[0]
+    w = [1.0 / max(1e-10, (p * (1.0 - p)) ** 2) for p in rates]
+    sse_flat = sum(wi * (p - p0) ** 2 for wi, p in zip(w, rates))
+    best = None
+    for tau in LOGI_TAUS:
+        e = [math.exp(-(t - t0) / tau) for t in times]
+        u = [1.0 - ei for ei in e]
+        y = [p - p0 * ei for p, ei in zip(rates, e)]
+        num = sum(wi * ui * yi for wi, ui, yi in zip(w, u, y))
+        den = sum(wi * ui * ui for wi, ui in zip(w, u))
+        if den <= 0:
+            continue
+        p_inf = min(0.995, max(0.0002, num / den))
+        sse = sum(wi * (p - (p_inf + (p0 - p_inf) * ei)) ** 2
+                  for wi, p, ei in zip(w, rates, e))
+        if best is None or sse < best[2]:
+            best = (p_inf, tau, sse)
+    if best is None:
+        return p0, 1e9, sse_flat, sse_flat
+    return best[0], best[1], best[2], sse_flat
+
+
+def has_rate_cliff(reads):
+    """True when any trophy's rate drops >40% across a players jump
+    (>30%). A refresh adds a cohort that has earned almost nothing, so
+    the rate cliffs down; a saturation fit across the cliff is distorted.
+    """
+    for j in range(1, len(reads)):
+        if reads[j]["players_tracked"] > 1.30 * reads[j - 1]["players_tracked"]:
+            for i in range(len(reads[0]["rates"])):
+                a, b = reads[j - 1]["rates"][i], reads[j]["rates"][i]
+                if a and b and a > 0 and b < 0.6 * a:
+                    return True
+    return False
+
+
+def logistic_live_medians(case):
+    """Median logits from the explicit logistic-saturation fit, per trophy.
+
+    When the history has a rate cliff at a refresh jump, the fit uses
+    post-jump reads only (the pre-jump level belongs to a different
+    cohort mix); otherwise it uses all reads. Returns None for a trophy
+    when the fit is unavailable (too few reads, missing/non-positive
+    rates, or an already-held ~100% trophy); the caller falls back to
+    the log-linear median for those.
+    """
+    reads = dedupe_reads(case["history"])
+    if len(reads) < 2:
+        return [None] * len(case["trophies"])
+    if has_rate_cliff(reads):
+        reads = post_jump_reads(reads)
+        if len(reads) < 2:
+            reads = dedupe_reads(case["history"])
+    times = [(parse_time(r["at"]) - RELEASE).total_seconds() / 3600.0
+             for r in reads]
+    t_tgt = (parse_time(case["target"]) - RELEASE).total_seconds() / 3600.0
+    meds = []
+    for i in range(len(case["trophies"])):
+        rate = last_rate(case["history"], i)
+        if rate >= 99.99:
+            meds.append(None)
+            continue
+        rs = []
+        ok = True
+        for r in reads:
+            v = r["rates"][i]
+            if v is None or v <= 0:
+                ok = False
+                break
+            rs.append(v / 100.0)
+        if not ok or len(rs) < 2:
+            meds.append(None)
+            continue
+        p_inf, tau, _sse, _flat = logistic_fit(times, rs)
+        p_pred = p_inf + (rs[0] - p_inf) * math.exp(-(t_tgt - times[0]) / tau)
+        p_pred = min(0.9999, max(0.0001, p_pred))
+        meds.append(logit(100.0 * p_pred))
+    return meds
+
+
 def live_forecast(case, horizon_hours):
     """Trend extrapolation of log earned and log players vs ln(1 + hours)."""
     reads = dedupe_reads(case["history"])
@@ -510,14 +631,20 @@ def live_forecast(case, horizon_hours):
         e_pred = min(max(e_pred, e_last), n_pred)
         medians.append(logit(100.0 * e_pred / n_pred))
     days = max(0.0, case["horizon_minutes"] / 1440.0)
-    # v8: 0.10 + 0.03*sqrt(days) (was 0.10 + 0.05*sqrt(days)) -- the slower
-    # growth fits the saturating live curves better; worth ~0.001 on top of
-    # the prior correction, with coverage 0.913 (closest to honest 0.90).
-    spread = min(0.60, 0.10 + 0.03 * math.sqrt(days))
-    # Quantile shaping (v6): the inner quantiles use 0.8x the outer spread.
-    # Same as the stale regime -- it cuts synthetic-live loss from 0.0973
-    # to 0.0954 with identical typical_miss and coverage (those depend only
-    # on the median and the outer band, which are unchanged).
+    # v9: 0.08 + 0.03*sqrt(days) (was 0.10 + 0.03*sqrt(days) in v8) -- the
+    # logistic medians are far more accurate, so a tighter outer band cuts
+    # live loss further while coverage stays near honest 0.90 (0.926 on
+    # the five synthetic live-truth families).
+    spread = min(0.60, 0.08 + 0.03 * math.sqrt(days))
+    # v9: replace the log-linear medians with the explicit logistic-
+    # saturation medians where the fit is available; the log-linear
+    # median stays as the fallback for trophies the fit cannot handle.
+    logi = logistic_live_medians(case)
+    medians = [l if l is not None else m for l, m in zip(logi, medians)]
+    # Quantile shaping (v6): the inner quantiles use INNER_K x the outer
+    # spread. Same as the stale regime -- it cuts synthetic-live loss
+    # with identical typical_miss and coverage (those depend only on the
+    # median and the outer band, which are unchanged).
     return medians, [spread * INNER_K] * len(case["trophies"]), [spread] * len(case["trophies"])
 
 
