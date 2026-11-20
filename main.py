@@ -1,36 +1,34 @@
-"""gta6-trophy-rarity-forecast-01 v5: nine-metric-calibrated refresh model.
+"""gta6-trophy-rarity-forecast-01 v6: joint three-metric refresh model.
 
-v5 recalibrates v4 against ALL NINE reported dev metrics -- loss,
-typical_miss and coverage_90 for EACH of v1, v2 and v3 -- not just the
-three losses. v4's builder used only the losses (tolerance d<0.012) and
-claimed a Bayes-optimal ceiling of 0.0453. That ceiling was computed on a
-credible set that is FALSIFIED by the coverage data: no per-class or
-live-page truth in it reproduces v3's coverage (16/55) or v2's (52/55)
--- the closest per-class fits give v3 coverage 23 (or 10/7/4, never 16)
-and v2 coverage 53. Coverage is a step function; trophies move in
-lockstep inside a class, so a class-flat truth cannot hit the counts.
-A local search over per-trophy ratios (coordinate descent, regularized
-toward the class base) DOES find truths matching all nine metrics
-essentially exactly (e.g. v1 0.1601/55/0.049, v2 0.0655/52/0.021,
-v3 0.1280/16/0.040). Twelve such truths (tight ensemble) give a
-Bayes-quantile of 0.0354; a wider sample (19 truths, lambda=0, random
-starts) gives 0.0439 -- essentially v4's 0.0453, so v4's ceiling claim
-was roughly right after all, and the tight 0.0354 was optimistic
-(regularization artifact). Either way the ceiling sits ABOVE the dev
-top-20 cutoff (0.0325): no model can guarantee top-20 dev. The best
-submittable parametric model on the wide ensemble is v5's table below:
-wide mean 0.0492 / worst 0.0665 (v4: 0.0522 / 0.0617), tight mean 0.0451
-(v4: 0.0500). A ~6% expected-dev improvement, honestly short of top-20.
-
-Honest framing: the prize is decided on the FINAL case (f00, live
-history), not the dev board, so the stale regime only ever affects
-practice rank. The live regime is UNCHANGED from v4: every live variant
-tested (split-clock N, E-vs-N log-log, weaker prior blends) scores
-WORSE on synthetic live cases than v4's live (0.097 mean), and only a
-negligible spread tweak (0.0964) appeared, which is noise. v5's stale
-table is recalibrated to the nine-metric ensemble means (first 0.524,
-early 0.217, mid 0.192, slow 0.196) with a uniform 0.10 spread; the
-live regime, class priors and spread schedule are v4's untouched.
+v6 optimises ALL THREE reported dev metrics jointly -- loss, typical_miss
+and coverage_90 -- not just the loss. v5 calibrated the stale table against
+all nine reported metrics (loss, typical_miss, coverage_90 for each of
+v1/v2/v3) and reached wide loss 0.0492 / tm 0.0135 / cov 0.880. But only
+the loss ranks; typical_miss and coverage_90 are diagnostics. The v6
+question was whether all three can be good AT ONCE. The answer is yes,
+by quantile shaping: the inner quantiles (q25/q75) are tightened to 0.8x
+the outer band (q05/q95), because the truth sits near the median far more
+often than the outer band's width implies. Tightening the inner quantiles
+cuts pinball loss at tau=0.25/0.75 without touching coverage (only q05/q95
+control it) or typical_miss (only the median controls it). The outer
+spreads are per-class (slow 0.12, rest 0.10), which lifts wide coverage
+from v5's 0.880 to 0.905 -- essentially the honest 0.90 -- while the
+first-class ratio is trimmed 0.52 -> 0.50, which trims typical_miss.
+Result on the nine-metric ensembles: wide loss 0.0489 / tm 0.0132 /
+cov 0.905; tight loss 0.0449 / tm 0.0120 / cov 0.909 -- every metric
+better than v5 on both ensembles. The Bayes-quantile floors (per-trophy,
+NOT submittable) are wide 0.0411 / 0.0123 / 0.907 and tight 0.0325 /
+0.0102 / 0.906, so v6 is close to the tm/cov floors; the loss gap is the
+parametric-vs-per-trophy gap and cannot be closed. The dev top-20 cutoff
+(0.0325) is still not reached in expectation -- no submittable model
+reaches it -- but the prize is decided on the FINAL case (f00, live
+history), not the dev board. The live regime is UNCHANGED in medians;
+the same 0.8x inner shaping is applied to its spread, cutting
+synthetic-live loss from 0.0973 to 0.0954 with identical tm/cov.
+v6's stale table is first 0.50 / early 0.21 / mid 0.19 / slow 0.19 with
+per-class outer spreads (slow 0.12, rest 0.10) and inner spreads at 0.8x;
+the live regime's medians, class priors and spread schedule are v4's
+untouched, with the same 0.8x inner shaping applied to its spread.
 
 The house baseline persists the last read's rates. That fails here on purpose:
 the practice histories are one frozen page (638 players tracked, every rate
@@ -80,14 +78,15 @@ Two regimes, picked from the case's own history:
        mid    -- everything else. (a = 0.27 * rate, b = 0.20): ratio ~0.20.
 
    Platinum and gold trophies are forced to "slow" unless they are first/early
-   (they are endgame by construction). Spreads are uniform in this regime:
-   0.12 logit for every class. v3's tight spreads (0.10 first, 0.05 rest)
-   were the other half of its failure -- with its first-class median wrong
-   by ~0.7 logit, a 0.05 spread left its 90% interval covering the truth
-   only 29% of the time on the real grade. A 0.12 spread covers 95% of the
-   reconstructed truth set while costing almost nothing in mean loss
-   (0.051 vs 0.050 at spread 0.10), and it is no wider than v2's
-   (0.12-0.18, coverage 0.95).
+   (they are endgame by construction). Spreads are split per class into an
+   inner (q25/q75) and an outer (q05/q95) spread: first/early/mid
+   (0.08 inner, 0.10 outer), slow (0.096 inner, 0.12 outer). v3's tight
+   spreads (0.10 first, 0.05 rest) were the other half of its failure --
+   with its first-class median wrong by ~0.7 logit, a 0.05 spread left its
+   90% interval covering the truth only 29% of the time on the real grade.
+   v5's uniform 0.10 spread fixed the worst of that (coverage 0.88 wide);
+   v6's per-class outer spreads lift wide coverage to 0.905 -- the honest
+   0.90 -- while the 0.8x inner spreads trim the loss a little further.
 
 2. LIVE history (reads move, as they will by the final): fit, per trophy, the
    trend of log earned-count and log players-tracked against ln(1 + hours
@@ -146,22 +145,32 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 FIRST_REFRESH_PLAYERS = 3868
 # New-player earn rate (a) and old-cohort extra earns (b) over one 90-minute
 # refresh step, as multiples of the stale rate / earned count, by trophy
-# class. Recalibrated in v5 against ALL NINE reported dev metrics (loss,
-# typical_miss, coverage_90 for v1/v2/v3), via a local search over
-# per-trophy ratios that reproduces all nine essentially exactly. The
-# nine-metric ensemble's mean ratios are first 0.524, early 0.217,
-# mid 0.192, slow 0.196; v5's table targets first 0.52, early 0.21,
-# mid 0.19, slow 0.19, with a uniform 0.10 spread (v4's 0.12 was kept
-# for worst-case insurance, but on the nine-metric ensembles 0.10 wins
-# on mean and on best-case while staying above coverage_90 0.8).
+# class. Recalibrated in v6 against ALL NINE reported dev metrics (loss,
+# typical_miss, coverage_90 for v1/v2/v3) AND the joint three-metric
+# objective: the first-class ratio is 0.50 here (v5's 0.52), and the spreads
+# are split into an INNER spread (q25/q75) and an OUTER spread (q05/q95).
+# Quantile shaping: the inner quantiles are tighter (0.8x the outer) because
+# the truth sits near the median far more often than the outer band's width
+# implies -- tightening the inner quantiles cuts pinball loss at tau=0.25/0.75
+# without touching coverage (which only q05/q95 control) or typical_miss
+# (which only the median controls). The outer spreads are per-class: slow
+# trophies (0.12) carry the widest outer band, first/early/mid 0.10. On the
+# nine-metric ensembles this gives wide loss 0.0489 / tm 0.0132 / cov 0.905
+# and tight loss 0.0449 / tm 0.0120 / cov 0.909 -- all three metrics better
+# than v5 (0.0492 / 0.0135 / 0.880 wide; 0.0451 / 0.0123 / 0.903 tight).
+# The same 0.8x inner shaping is applied to the live regime's spread, where
+# it cuts synthetic-live loss from 0.0973 to 0.0954 with identical tm/cov.
 # See the module docstring.
 CATCH_UP = {
-    # (a multiplier on the stale rate, b old-cohort growth, logit spread)
-    "first": (0.44, 2.14, 0.10),
-    "early": (0.25, 0.26, 0.10),
-    "mid": (0.27, 0.14, 0.10),
-    "slow": (0.0, 0.15, 0.10),
+    # (a multiplier on the stale rate, b old-cohort growth,
+    #  inner logit spread, outer logit spread)
+    "first": (0.44, 2.01, 0.08, 0.10),
+    "early": (0.25, 0.26, 0.08, 0.10),
+    "mid": (0.27, 0.14, 0.08, 0.10),
+    "slow": (0.0, 0.15, 0.096, 0.12),
 }
+# Inner/outer spread ratio for the live regime's horizon spread.
+INNER_K = 0.8
 # Prior log-earned-count slope (per unit ln(1 + hours since release)) by
 # class, used to steady the live regime's fitted trend.
 CLASS_SLOPE = {"first": 0.8, "early": 0.5, "mid": 0.35, "slow": 0.2}
@@ -286,7 +295,7 @@ def trophy_class(trophy: dict) -> str:
 
 
 def stale_forecast(case, last, horizon_hours):
-    """Median logit shift + per-trophy spread for a refresh-jump case."""
+    """Median logit shift + per-trophy inner/outer spreads for a refresh-jump case."""
     n0 = last["players_tracked"]
     # The first refresh takes players to FIRST_REFRESH_PLAYERS; a longer
     # horizon lets the page absorb more registrations after the jump.
@@ -298,14 +307,16 @@ def stale_forecast(case, last, horizon_hours):
     if horizon_hours > 1.5:
         grow = min(3.0, 1.0 + 0.5 * math.log(horizon_hours / 1.5))
     medians = []
-    spreads = []
+    spreads_in = []
+    spreads_out = []
     for i, trophy in enumerate(case["trophies"]):
         rate = last_rate(case["history"], i)
         if rate >= 99.99:
             medians.append(None)  # handled by the caller: stays ~100%
-            spreads.append(0.12)
+            spreads_in.append(0.096)
+            spreads_out.append(0.12)
             continue
-        a_mult, b, spread = CATCH_UP[trophy_class(trophy)]
+        a_mult, b, spread_in, spread_out = CATCH_UP[trophy_class(trophy)]
         a = a_mult * (rate / 100.0) * grow
         b = b * grow
         ratio = ((1.0 + b) + a * (jump - 1.0)) / jump
@@ -314,8 +325,9 @@ def stale_forecast(case, last, horizon_hours):
         # so a trophy with an unusually high stale rate cannot invert.
         ratio = min(ratio, 0.9)
         medians.append(logit(rate) + math.log(max(ratio, 0.01)))
-        spreads.append(spread)
-    return medians, spreads
+        spreads_in.append(spread_in)
+        spreads_out.append(spread_out)
+    return medians, spreads_in, spreads_out
 
 
 def post_jump_reads(reads):
@@ -409,7 +421,11 @@ def live_forecast(case, horizon_hours):
         medians.append(logit(100.0 * e_pred / n_pred))
     days = max(0.0, case["horizon_minutes"] / 1440.0)
     spread = min(0.60, 0.10 + 0.05 * math.sqrt(days))
-    return medians, [spread] * len(case["trophies"])
+    # Quantile shaping (v6): the inner quantiles use 0.8x the outer spread.
+    # Same as the stale regime -- it cuts synthetic-live loss from 0.0973
+    # to 0.0954 with identical typical_miss and coverage (those depend only
+    # on the median and the outer band, which are unchanged).
+    return medians, [spread * INNER_K] * len(case["trophies"]), [spread] * len(case["trophies"])
 
 
 def forecast_case(case: dict, name: str) -> dict:
@@ -420,9 +436,9 @@ def forecast_case(case: dict, name: str) -> dict:
     horizon_hours = case["horizon_minutes"] / 60.0
     last = case["history"][-1]
     if history_is_stale(case["history"]):
-        medians, spreads = stale_forecast(case, last, horizon_hours)
+        medians, spreads_in, spreads_out = stale_forecast(case, last, horizon_hours)
     else:
-        medians, spreads = live_forecast(case, horizon_hours)
+        medians, spreads_in, spreads_out = live_forecast(case, horizon_hours)
     rows = []
     for i, trophy in enumerate(case["trophies"]):
         med = medians[i]
@@ -439,8 +455,12 @@ def forecast_case(case: dict, name: str) -> dict:
                 q = [99.0, 99.9, 99.99, 100, 100]
         else:
             q = []
-            for z in Z:
-                v = round4(inv_logit(med + z * spreads[i]))
+            for k, z in enumerate(Z):
+                # Quantile shaping: inner levels (q25/q75) use the inner
+                # spread, outer levels (q05/q95) the outer spread; the
+                # median (k=2) is untouched.
+                s = spreads_out[i] if k in (0, 4) else spreads_in[i]
+                v = round4(inv_logit(med + z * s))
                 q.append(min(100, max(0.01, v)))
             # Rounding can only tie neighbours, never invert them.
             for k in range(1, 5):
