@@ -1,22 +1,32 @@
-"""gta6-trophy-rarity-forecast-01 v3: two-grade-calibrated refresh hedge.
+"""gta6-trophy-rarity-forecast-01 v4: three-grade-calibrated refresh model.
 
-v3 recalibrates v2 against the two real dev grades (v1: 0.160095, v2:
-0.0656), which pin down the practice answer far tighter than v2's local
-grid could. The answer's refresh ratio is nearly FLAT (~0.18) with only a
-mild tilt toward higher stale rates: over the 90-minute refresh step, newly
-tracked players earned almost nothing, whatever the trophy. v2's class
-ladder overshot badly -- its "first" trophies forecast a 0.37-0.45 ratio
-against a true ~0.19 (mean logit error +0.69 on that class), while its
-slow class was already exact. v3 therefore flattens the ladder to a hedge
-between the two truth families that jointly reproduce both grades (a
-rate-tilt family and a live-page family, which disagree mainly on the
-first class): first ~0.21-0.24, early ~0.18, mid ~0.175, slow ~0.173,
-with tight spreads (0.10 first, 0.05 rest -- the families agree to ~0.05
-logit everywhere else). On the 100-truth credible set (every tilt/live
-truth reproducing both grades within 0.01), v3 scores mean 0.023, worst
-0.032, against v2's 0.066/0.070. The stale regime only ever fires on
-practice-style frozen histories; the final's history will be live, so
-this calibration cannot hurt the final -- it only buys dev-board rank.
+v4 recalibrates v3 against ALL THREE real dev grades (v1: 0.160095,
+v2: 0.0656, v3: 0.128), which overturn v3's diagnosis. v3's builder
+believed the answer's refresh ratio was nearly FLAT (~0.18) with only a
+mild tilt; that family reproduces v1+v2 but FAILS v3 (it predicts v1 at
+0.131, not 0.160). Three grades, not two, pin down the truth: the
+families that reproduce all three are a PER-CLASS ratio family and a
+live-page family. Both say the same thing -- the FIRST class (Chapter 1,
+a fishing challenge, an arcade game) has a HIGH ratio (~0.5-0.6), higher
+even than v2's 0.31-0.45. v2 was right to give the first class a steep
+ladder; v3 flattening it to 0.21-0.24 is what cost it 0.128, and v3's
+tight spreads (0.05 outside first) gave it a dev coverage_90 of only
+0.29 -- its intervals were far too narrow for how wrong its first-class
+median was. v4 therefore RESTORES a steep first-class ladder (ratio
+~0.50) and WIDENS the spread to a uniform 0.12 logit (coverage_90 0.95
+on the reconstructed credible set, vs v3's 0.31 and v2's 0.95). On the
+40-truth credible set (every per-class/live-page truth reproducing all
+three grades within 0.012), v4 scores mean 0.051, worst 0.076, against
+v2's 0.066/0.075 and v3's 0.129/0.138. Honest limit: even the
+Bayes-optimal forecast over this set scores only 0.045 mean, so no
+model can reliably reach the dev top-20 cutoff (0.0325) -- the three
+grades do not pin the truth down that tightly. v4 is still clearly
+better than v2 on every truth family, and its live regime is v3's
+unchanged (synthetic-live 0.094-0.106 vs v2's 0.151-0.156), which is
+what the final prize actually turns on. The stale regime only ever
+fires on practice-style frozen histories; the final's history will be
+live, so this calibration cannot hurt the final -- it only buys
+dev-board rank.
 
 The house baseline persists the last read's rates. That fails here on purpose:
 the practice histories are one frozen page (638 players tracked, every rate
@@ -40,30 +50,40 @@ Two regimes, picked from the case's own history:
        earned' = earned * (1 + b) + (players' - players) * a * rate / 100
        rate'   = rate * ((1 + b) + a * (G - 1)) / G
 
-   The catch-up is nearly flat across trophies -- the two-grade calibration
-   says earned counts grow only ~5% for most trophies over one refresh step,
-   ~30% for the very first ones (Chapter 1, a fishing challenge, an arcade
-   game), because even those take new players longer than 90 minutes to reach
-   in bulk. Classes are read from the trophy's own name and description (in
-   the case file, not from any outside data); the numbers below are the
-   recalibrated (a, b) pairs that reproduce the hedged class ratios:
+   The catch-up is steepest for the very first trophies -- Chapter 1, a
+   fishing challenge, an arcade game -- because new players reach those
+   within their first session, so their earned counts roughly triple over
+   one refresh step while the player base grows 6x. The other classes
+   barely move: their earned counts grow only ~15-20% over the step,
+   because new players have not had time to reach them. Classes are read
+   from the trophy's own name and description (in the case file, not from
+   any outside data); the numbers below are the recalibrated (a, b) pairs
+   that reproduce the three-grade-calibrated class ratios:
 
        first  -- Chapter 1, a fishing challenge, an arcade game.
-                 (a = 3.3 * rate, b = 0.10): ratio ~0.21-0.24.
+                 (a = 0.44 * rate, b = 2.00): ratio ~0.50. The old
+                 cohort roughly triples its earned count in 90 minutes
+                 (these are the trophies active launch-night players are
+                 earning right now), while new players earn at 0.44x the
+                 stale rate.
        early  -- Chapter 2, the opening mission, passive discovery,
-                 an unscheduled departure, bowling. (a = 0.66 * rate,
-                 b = 0.06): ratio ~0.18.
+                 an unscheduled departure, bowling. (a = 0.25 * rate,
+                 b = 0.20): ratio ~0.20.
        slow   -- endgame, grinds and collections: final missions, later
                  chapters, 100% completion, 250 stunts, card sets, 100
-                 locations, 50 challenges. (a = 0.28 * rate, b = 0.04):
-                 ratio ~0.173.
-       mid    -- everything else. (a = 0.25 * rate, b = 0.05): ratio ~0.175.
+                 locations, 50 challenges. (a = 0.0, b = 0.15): ratio
+                 ~0.19 -- new players reach none of these in 90 minutes.
+       mid    -- everything else. (a = 0.27 * rate, b = 0.20): ratio ~0.20.
 
    Platinum and gold trophies are forced to "slow" unless they are first/early
-   (they are endgame by construction). Spreads are per trophy in this regime:
-   0.10 for first (the two truth families disagree most there), 0.05 otherwise
-   (the families agree to ~0.05 logit). v2's spreads (0.12-0.18) and ladder
-   (top ratio 0.45) cost it ~0.04 of loss against the real grades.
+   (they are endgame by construction). Spreads are uniform in this regime:
+   0.12 logit for every class. v3's tight spreads (0.10 first, 0.05 rest)
+   were the other half of its failure -- with its first-class median wrong
+   by ~0.7 logit, a 0.05 spread left its 90% interval covering the truth
+   only 29% of the time on the real grade. A 0.12 spread covers 95% of the
+   reconstructed truth set while costing almost nothing in mean loss
+   (0.051 vs 0.050 at spread 0.10), and it is no wider than v2's
+   (0.12-0.18, coverage 0.95).
 
 2. LIVE history (reads move, as they will by the final): fit, per trophy, the
    trend of log earned-count and log players-tracked against ln(1 + hours
@@ -122,20 +142,22 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 FIRST_REFRESH_PLAYERS = 3868
 # New-player earn rate (a) and old-cohort extra earns (b) over one 90-minute
 # refresh step, as multiples of the stale rate / earned count, by trophy
-# class. Recalibrated in v3 against the two real dev grades (v1 0.160095,
-# v2 0.0656): the answer's refresh ratio is nearly flat (~0.18) with only a
-# mild tilt, so the ladder is far flatter than v2's (first 15.0 -> 3.3,
-# early 3.0 -> 0.66, mid 1.0 -> 0.25, slow 0.5 -> 0.28) and the spreads
-# much tighter (first 0.10, rest 0.05). The resulting ratios: first
-# ~0.21-0.24, early ~0.18, mid ~0.175, slow ~0.173 -- a hedge between the
-# two truth families that reproduce both grades (rate-tilt and live-page),
-# which disagree mainly on the first class. See the module docstring.
+# class. Recalibrated in v4 against all THREE real dev grades (v1 0.160095,
+# v2 0.0656, v3 0.128): v3's "nearly flat ~0.18" diagnosis is falsified by
+# the third grade -- the families that reproduce all three grades put the
+# first class HIGH (~0.5), not flat. The ladder is therefore restored to
+# a steep first class (first 0.44/2.00, early 0.25/0.20, mid 0.27/0.20,
+# slow 0.0/0.15) and the spread widened to a uniform 0.12 (v3's 0.05
+# outside first gave coverage_90 0.29 on the real grade). The resulting
+# ratios: first ~0.50, early ~0.20, mid ~0.20, slow ~0.19 -- the
+# three-grade consensus of the per-class and live-page truth families.
+# See the module docstring.
 CATCH_UP = {
     # (a multiplier on the stale rate, b old-cohort growth, logit spread)
-    "first": (3.3, 0.10, 0.10),
-    "early": (0.66, 0.06, 0.05),
-    "mid": (0.25, 0.05, 0.05),
-    "slow": (0.28, 0.04, 0.05),
+    "first": (0.44, 2.00, 0.12),
+    "early": (0.25, 0.20, 0.12),
+    "mid": (0.27, 0.20, 0.12),
+    "slow": (0.0, 0.15, 0.12),
 }
 # Prior log-earned-count slope (per unit ln(1 + hours since release)) by
 # class, used to steady the live regime's fitted trend.
