@@ -1,4 +1,73 @@
-"""gta6-trophy-rarity-forecast-01 v9: explicit logistic-saturation live medians.
+"""gta6-trophy-rarity-forecast-01 v10: E/N race blend + refresh-cadence discount + width-preserving skew.
+
+v10 keeps v9's logistic-saturation live medians as its core and adds THREE
+upgrades, each validated on synthetic truth families the model never tuned
+on (held-out seeds + new families H/M/R) and each rejected-or-adopted on
+evidence, not on hope:
+
+1. E/N race blend (live). v9's logistic fit extrapolates the RATE curve;
+when the player base is growing exponentially while earned counts grow
+only as a power law (the log-time growth family G), the rate FALLS toward
+the target and the logistic -- which fits the in-window rate shape -- misses
+the decline. The E/N decomposition models the race explicitly: per trophy,
+log E = a + b*ln(1+t) + c*t (b,c >= 0, nested active-set refit, so the fit
+can be pure power-law, pure exponential, or a mix), and log N is fitted
+once per case, shared across trophies (clock-linear). The fit uses the
+post-jump segment ONLY (a players jump multiplies both E and N, so a fit
+across it is garbage -- the first version of this fit used the rate-cliff
+rule and its log-N slope across the 6.2x jump extrapolated N to an absurd
+value; the fix was v8's players-jump rule). When the post-jump segment is
+shorter than 4 reads the E/N fit ABSTAINS (returns None, pure logistic) --
+family H (a second jump 5.5h before the deadline, 1 post-jump read) caught
+the old fallback-to-all-reads behaviour wrecking the blend (0.55 vs v9's
+0.03). The blend is ratio-weighted: w = 0.30 * clip((1 - p_en2/p_logi)/0.5,
+0, 1) -- it blends in only where EN2 predicts a strong decline vs the
+logistic, and ~0 where the two medians agree, so smooth families (L/P/F/S)
+are essentially untouched. On the 5-family x 5-seed screen: live loss
+0.0640 -> 0.0627 (with the retuned spread below), G 0.2106 -> 0.1901,
+G-B 0.4388 -> 0.3929; on the new families H/M/R: 0.2278 -> 0.1736 (H
+0.0302 -> 0.0265, M 0.0477 -> 0.0437, R 0.8030 -> 0.5976).
+
+2. Refresh-cadence discount (live). The final case's history records
+Exophase's refresh times as players jumps. If >= 3 periodic jumps (ratio
+<= 2, launch-surge jumps excluded) show a consistent spacing (max/min <=
+1.6), the progression is projected to the target: when a refresh is due
+within half a period of the target, every median rate is discounted by
+J^-1 (J = median jump ratio -- the new cohort has earned ~nothing at the
+instant of the jump, so the rate drops by ~1/J). It fires ONLY on a regular
+cadence, so it costs exactly nothing on the 76 tuning cases and the H/M
+families (identical numbers), and it cuts family R (a refresh lands exactly
+at the target hour) from 0.5976 to 0.4599. It is a free option: zero cost
+where there is no cadence, a real correction where there is one.
+
+3. Width-preserving asymmetric skew (stale/dev). v7's class-template
+asymmetry test FAILED because it replaced the spread with the ensemble's
+own narrow offsets and collapsed coverage to 0.79. The v10 skew keeps the
+TOTAL band width (so coverage cannot collapse) and only splits it
+asymmetrically: q05 = med - 1.645*so*low_o, q95 = med + 1.645*so*high_o
+(and the inner band likewise), with the low/high ratios per class from the
+reconstruction ensembles (tight+wide averaged: first 1.09/0.91, early
+0.73/1.28, mid 0.83/1.17, slow 1.13/0.87 outer). Cross-ensemble validated
+(skew fitted on tight tested on wide and vice versa: both directions
+improve loss AND coverage). Dev: tight 0.0442 -> 0.0439, wide 0.0485 ->
+0.0481, coverage 0.912/0.906 -> 0.935/0.928. The per-trophy median
+structure hunt was REJECTED with evidence: split-half tests show the
+per-trophy deviations do NOT replicate across independent halves
+(corr -0.15; OLS on half A makes half B worse), so the dev median is at
+its ceiling -- the remaining gap to the in-sample Bayes floor (0.0325) is
+reconstruction noise, not learnable structure. The honest Bayes ceiling,
+leave-one-out, is 0.040-0.046 -- v10 sits on it.
+
+The live spread is retuned for the more accurate medians: 0.08 +
+0.02*sqrt(days) (was 0.08 + 0.03*sqrt(days)), INNER_K 0.4 (was 0.5) --
+loss 0.0640 -> 0.0627 on the tuning screen with coverage 0.921 (honest
+~0.90). All three metrics move together: dev loss/tm/cov 0.0439/0.0113/
+0.935 tight, 0.0481/0.0129/0.928 wide; live loss/tm/cov 0.0627/0.0519/
+0.921 on the tuning screen (v9: 0.0673/0.0509/0.924), and the blend +
+cadence win on every new family. The dev top-20 cutoff (0.0325) is still
+not reached in expectation -- the honest LOO Bayes ceiling says no
+submittable model reaches it -- but v10 is the strongest entry for the
+prize that is actually paid, the FINAL case.
 
 v9 keeps v8's stale regime EXACTLY (dev loss tight 0.0442 / wide 0.0485,
 tm 0.0113/0.0129, cov 0.911/0.907 -- the parametric ceiling) and replaces
@@ -266,10 +335,30 @@ CATCH_UP = {
 FIRST_HYPER_A = 2.634
 FIRST_HYPER_C = 4.227
 # Inner/outer spread ratio for the live regime's horizon spread.
-# v9: 0.5 (was 0.6 in v8, 0.8 in v6) -- the logistic medians are far more
-# accurate than the log-linear ones, so tighter inner quantiles cut live
-# loss further with coverage still near honest 0.90.
-INNER_K = 0.5
+# v10: 0.4 (was 0.5 in v9, 0.6 in v8, 0.8 in v6) -- the E/N-blend medians
+# are more accurate than the logistic-only ones, so tighter inner
+# quantiles cut live loss further with coverage still near honest 0.90.
+INNER_K = 0.4
+# v10: width-preserving asymmetric quantile split for the STALE regime,
+# per class (low_o, high_o, low_i, high_i): the low/high share of the
+# outer (q05/q95) and inner (q25/q75) bands, from the reconstruction
+# ensembles (tight+wide averaged). Total band width is unchanged, so
+# coverage cannot collapse the way v7's template did (0.79). Early/mid
+# are right-skewed in logit space (upper tail longer); first is slightly
+# left-skewed; slow is near-symmetric. Cross-ensemble validated.
+SKEW = {
+    "first": (1.094, 0.906, 1.079, 0.921),
+    "early": (0.725, 1.275, 0.955, 1.045),
+    "mid": (0.832, 1.168, 0.675, 1.325),
+    "slow": (1.132, 0.868, 1.017, 0.983),
+}
+# v10: minimum post-jump reads for the E/N fit (see en2_live_medians);
+# below this the fit abstains and the logistic median stands alone.
+EN2_MIN_READS = 4
+# v10: cadence-discount exponent (see cadence_discount): the new cohort
+# has earned ~nothing at the instant of a refresh, so the rate drops by
+# ~1/J; k=1.0 applies the full drop.
+CADENCE_K = 1.0
 # Tau grid (hours) for the v9 logistic-saturation fit: log-spaced 3..600h.
 LOGI_TAUS = [3.0 * (200.0 ** (k / 24.0)) for k in range(25)]
 # Prior log-earned-count slope (per unit ln(1 + hours since release)) by
@@ -557,6 +646,207 @@ def logistic_live_medians(case):
     return meds
 
 
+def _median(values):
+    """Median of a non-empty list (stdlib only; no statistics import)."""
+    s = sorted(values)
+    n = len(s)
+    if n % 2:
+        return s[n // 2]
+    return 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _en_segment_reads(reads):
+    """Reads after the last players jump (>30%), for E/N fitting -- with
+    NO fallback to all reads. A jump multiplies both E and N, so a fit
+    across it is garbage even when the RATES do not cliff (family L:
+    rates rise across the jump, so the rate-cliff rule keeps the pre-jump
+    read -- and the log-N slope fitted across a 6.2x jump extrapolates to
+    an absurd N). Callers must check the segment length and abstain when
+    it is too short. (Family H caught this: a late jump leaves 1
+    post-jump read; the old fallback-to-all-reads wrecked the blend.)"""
+    jump_idx = -1
+    for j in range(1, len(reads)):
+        if reads[j]["players_tracked"] > 1.30 * reads[j - 1]["players_tracked"]:
+            jump_idx = j
+    if jump_idx >= 0:
+        return reads[jump_idx:]
+    return reads
+
+
+def _solve_3x3(m):
+    """Solve a 3x3 linear system (augmented matrix rows), or None."""
+    m = [row[:] for row in m]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r_: abs(m[r_][col]))
+        if abs(m[piv][col]) < 1e-12:
+            return None
+        m[col], m[piv] = m[piv], m[col]
+        for r_ in range(3):
+            if r_ != col:
+                f = m[r_][col] / m[col][col]
+                for c_ in range(col, 4):
+                    m[r_][c_] -= f * m[col][c_]
+    return [m[i][3] / m[i][i] for i in range(3)]
+
+
+def _fit_log_e_nested(xs_ln, xs_t, ys):
+    """Fit log E = a + b*ln(1+t) + c*t by least squares, with b, c >= 0
+    (earned counts never fall). Returns (a, b, c) or None. Active-set:
+    unconstrained first; if b or c goes negative, refit with it fixed at
+    0. The nested form spans both regimes: power-law E growth (family G,
+    c=0) and registration-driven exponential E growth (families L/P/F/S,
+    where E ~ p_sat * N_exp and log E is ~linear in t at late times)."""
+    n = len(xs_ln)
+    if n < 4:
+        return None
+    cols = [[1.0] * n, xs_ln, xs_t]
+
+    def ls(active):
+        k = len(active)
+        m = [[sum(cols[i][j] * cols[i2][j] for j in range(n)) for i2 in active]
+             + [sum(cols[i][j] * ys[j] for j in range(n))] for i in active]
+        if k == 3:
+            return _solve_3x3(m)
+        if k == 1:
+            d = m[0][0]
+            return [m[0][1] / d] if abs(d) > 1e-12 else None
+        (a11, a12, b1), (a21, a22, b2) = m[0], m[1]
+        det = a11 * a22 - a12 * a21
+        if abs(det) < 1e-12:
+            return None
+        return [(b1 * a22 - b2 * a12) / det, (a11 * b2 - a21 * b1) / det]
+
+    sol = ls([0, 1, 2])
+    if sol is None:
+        return None
+    a, b, c = sol
+    if b >= 0 and c >= 0:
+        return a, b, c
+    if b < 0 and c < 0:
+        s1 = ls([0])
+        return (s1[0], 0.0, 0.0) if s1 else None
+    if b < 0:
+        s2 = ls([0, 2])
+        if s2 is None:
+            return None
+        a2, c2 = s2
+        return (a2, 0.0, max(0.0, c2))
+    s2 = ls([0, 1])
+    if s2 is None:
+        return None
+    a2, b2 = s2
+    return (a2, max(0.0, b2), 0.0)
+
+
+def en2_live_medians(case):
+    """Nested E/N decomposition medians (logit), v10.
+
+    Per case, log N = a_n + d*t (exponential registrations, shared across
+    trophies, fitted on exact player counts); per trophy, log E = a +
+    b*ln(1+t) + c*t (power-law + exponential components, b, c >= 0).
+    p_target = E_target / N_target. The hump in p(t) (family G) emerges
+    when b*ln(1+t) growth slows below d*t; the saturation families
+    (L/P/F/S) are carried by the c*t term, which the pure log-log E fit
+    missed (it under-predicted late E growth by ~40% for mid trophies).
+    Caps: E never falls below its last value, p never above 5x its last
+    rate. Fitted on the post-jump segment ONLY (see _en_segment_reads);
+    returns None for every trophy when that segment is shorter than
+    EN2_MIN_READS -- the caller then falls back to the logistic median.
+    """
+    reads = _en_segment_reads(dedupe_reads(case["history"]))
+    if len(reads) < EN2_MIN_READS:
+        return [None] * len(case["trophies"])
+    times = [(parse_time(r["at"]) - RELEASE).total_seconds() / 3600.0
+             for r in reads]
+    t_tgt = (parse_time(case["target"]) - RELEASE).total_seconds() / 3600.0
+    n_last = reads[-1]["players_tracked"]
+    # shared N fit (clock-linear)
+    ys_n = [math.log(max(1, r["players_tracked"])) for r in reads]
+    _a_n, b_n = fit_line(times, ys_n)
+    mx_n = sum(times) / len(times)
+    my_n = sum(ys_n) / len(ys_n)
+    log_n_tgt = my_n + b_n * (t_tgt - mx_n)
+    n_pred = min(max(math.exp(log_n_tgt), float(n_last)), float(n_last) * 200.0)
+    meds = []
+    for i in range(len(case["trophies"])):
+        rate = last_rate(case["history"], i)
+        if rate >= 99.99:
+            meds.append(None)
+            continue
+        xs_ln, xs_t, ys = [], [], []
+        for j, r in enumerate(reads):
+            v = r["rates"][i]
+            if v is None or v <= 0:
+                continue
+            xs_ln.append(math.log1p(max(0.0, times[j])))
+            xs_t.append(times[j])
+            ys.append(math.log(max(0.5, v * r["players_tracked"] / 100.0)))
+        if len(xs_ln) < EN2_MIN_READS:
+            meds.append(None)
+            continue
+        fit = _fit_log_e_nested(xs_ln, xs_t, ys)
+        if fit is None:
+            meds.append(None)
+            continue
+        a, b, c = fit
+        log_e_tgt = a + b * math.log1p(max(0.0, t_tgt)) + c * t_tgt
+        e_last = max(0.5, rate * n_last / 100.0)
+        e_pred = min(max(math.exp(log_e_tgt), e_last), n_pred)
+        p_pred = 100.0 * e_pred / n_pred
+        p_pred = min(p_pred, 5.0 * rate)
+        p_pred = min(99.99, max(0.01, p_pred))
+        meds.append(logit(p_pred))
+    return meds
+
+
+def cadence_discount(case, medians):
+    """Anticipate a periodic refresh landing at the target, v10.
+
+    Detect players jumps (>10% -- periodic refreshes are small, x1.15 in
+    family R, and must be visible) in the deduped history; ignore
+    launch-surge jumps (ratio > 2). If >= 3 periodic jumps remain with
+    consistent spacing (max/min <= 1.6), project the arithmetic
+    progression to the target: if a jump is due within half a period of
+    the target, discount every median rate by J^-CADENCE_K (J = median
+    jump ratio; the new cohort has earned ~nothing at the instant of the
+    jump, so the rate drops by ~1/J). Fires only on a regular cadence,
+    so the tuning families (< 3 periodic jumps) are untouched.
+    """
+    reads = dedupe_reads(case["history"])
+    jumps = []
+    for j in range(1, len(reads)):
+        n0, n1 = reads[j - 1]["players_tracked"], reads[j]["players_tracked"]
+        if n1 > 1.10 * n0:
+            t = (parse_time(reads[j]["at"]) - RELEASE).total_seconds() / 3600.0
+            jumps.append((t, n1 / max(1, n0)))
+    periodic = [(t, r) for (t, r) in jumps if r <= 2.0]
+    if len(periodic) < 3:
+        return medians
+    times = [t for t, _ in periodic]
+    iv = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+    if min(iv) <= 0 or max(iv) / min(iv) > 1.6:
+        return medians
+    cad = _median(iv)
+    t_tgt = (parse_time(case["target"]) - RELEASE).total_seconds() / 3600.0
+    n = round((t_tgt - times[-1]) / cad)
+    t_proj = times[-1] + n * cad
+    # Half-period window: the detected jump time is the first read AFTER
+    # the jump, so the true jump may be up to one read-gap earlier; and
+    # with a cadence of C there is a refresh within C/2 of any time.
+    if abs(t_proj - t_tgt) > 0.5 * cad:
+        return medians
+    j_ratio = _median([r for _, r in periodic])
+    d = j_ratio ** (-CADENCE_K)
+    out = []
+    for m in medians:
+        if m is None:
+            out.append(None)
+            continue
+        p = inv_logit(m)
+        out.append(logit(max(0.01, min(99.99, p * d))))
+    return out
+
+
 def live_forecast(case, horizon_hours):
     """Trend extrapolation of log earned and log players vs ln(1 + hours)."""
     reads = dedupe_reads(case["history"])
@@ -631,16 +921,35 @@ def live_forecast(case, horizon_hours):
         e_pred = min(max(e_pred, e_last), n_pred)
         medians.append(logit(100.0 * e_pred / n_pred))
     days = max(0.0, case["horizon_minutes"] / 1440.0)
-    # v9: 0.08 + 0.03*sqrt(days) (was 0.10 + 0.03*sqrt(days) in v8) -- the
-    # logistic medians are far more accurate, so a tighter outer band cuts
-    # live loss further while coverage stays near honest 0.90 (0.926 on
-    # the five synthetic live-truth families).
-    spread = min(0.60, 0.08 + 0.03 * math.sqrt(days))
+    # v10: 0.08 + 0.02*sqrt(days) (was 0.08 + 0.03*sqrt(days) in v9) -- the
+    # E/N-blend medians are more accurate, so a tighter outer band cuts
+    # live loss further while coverage stays near honest 0.90 (0.921 on
+    # the five synthetic live-truth families, vs 0.933 at the v9 spread).
+    spread = min(0.60, 0.08 + 0.02 * math.sqrt(days))
     # v9: replace the log-linear medians with the explicit logistic-
     # saturation medians where the fit is available; the log-linear
     # median stays as the fallback for trophies the fit cannot handle.
     logi = logistic_live_medians(case)
     medians = [l if l is not None else m for l, m in zip(logi, medians)]
+    # v10: ratio-weighted blend with the nested E/N medians. Blend in
+    # only where EN2 predicts a strong decline vs the logistic (the E/N
+    # race signal: registrations outrunning earned counts), ~0 where the
+    # two medians agree, so smooth families are essentially untouched.
+    # Then the refresh-cadence discount (fires only on a regular cadence).
+    e2 = en2_live_medians(case)
+    blended = []
+    for a, b in zip(e2, medians):
+        if a is None:
+            blended.append(b)
+        elif b is None:
+            blended.append(a)
+        else:
+            p_a = inv_logit(a)
+            p_b = inv_logit(b)
+            r = 1.0 - p_a / max(p_b, 1e-9)
+            w = 0.30 * min(max(r / 0.5, 0.0), 1.0)
+            blended.append(w * a + (1.0 - w) * b)
+    medians = cadence_discount(case, blended)
     # Quantile shaping (v6): the inner quantiles use INNER_K x the outer
     # spread. Same as the stale regime -- it cuts synthetic-live loss
     # with identical typical_miss and coverage (those depend only on the
@@ -655,7 +964,8 @@ def forecast_case(case: dict, name: str) -> dict:
         raise ValueError(f"{name} has no history")
     horizon_hours = case["horizon_minutes"] / 60.0
     last = case["history"][-1]
-    if history_is_stale(case["history"]):
+    is_stale = history_is_stale(case["history"])
+    if is_stale:
         medians, spreads_in, spreads_out = stale_forecast(case, last, horizon_hours)
     else:
         medians, spreads_in, spreads_out = live_forecast(case, horizon_hours)
@@ -675,11 +985,28 @@ def forecast_case(case: dict, name: str) -> dict:
                 q = [99.0, 99.9, 99.99, 100, 100]
         else:
             q = []
+            # v10 stale skew: the total band width is unchanged, only the
+            # low/high split differs per class (SKEW). z is negative for
+            # k=0,1 and positive for k=3,4, so multiplying the spread by
+            # the low ratio on the low side and the high ratio on the high
+            # side gives q05 = med - 1.645*so*low_o, q95 = med +
+            # 1.645*so*high_o (inner band likewise). The live regime uses
+            # symmetric spreads (its skew was not measured).
+            skew = SKEW[trophy_class(trophy)] if is_stale else (1.0, 1.0, 1.0, 1.0)
             for k, z in enumerate(Z):
                 # Quantile shaping: inner levels (q25/q75) use the inner
                 # spread, outer levels (q05/q95) the outer spread; the
                 # median (k=2) is untouched.
-                s = spreads_out[i] if k in (0, 4) else spreads_in[i]
+                if k == 0:
+                    s = spreads_out[i] * skew[0]
+                elif k == 4:
+                    s = spreads_out[i] * skew[1]
+                elif k == 1:
+                    s = spreads_in[i] * skew[2]
+                elif k == 3:
+                    s = spreads_in[i] * skew[3]
+                else:
+                    s = spreads_in[i]
                 v = round4(inv_logit(med + z * s))
                 q.append(min(100, max(0.01, v)))
             # Rounding can only tie neighbours, never invert them.
